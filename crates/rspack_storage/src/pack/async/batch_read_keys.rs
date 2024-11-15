@@ -3,15 +3,15 @@ use std::{path::PathBuf, sync::Arc};
 use futures::{future::join_all, TryFutureExt};
 use rspack_error::{error, Result};
 
-use crate::pack::{PackKeys, PackStorageFs};
+use crate::pack::{PackKeys, Strategy};
 
 pub async fn batch_read_keys(
   candidates: Vec<PathBuf>,
-  fs: Arc<PackStorageFs>,
+  strategy: Arc<dyn Strategy>,
 ) -> Result<Vec<PackKeys>> {
   let tasks = candidates.into_iter().map(|path| {
-    let fs = fs.to_owned();
-    tokio::spawn(async move { fs.read_pack_keys(&path) }).map_err(|e| error!("{}", e))
+    let strategy = strategy.to_owned();
+    tokio::spawn(async move { strategy.read_keys(&path) }).map_err(|e| error!("{}", e))
   });
 
   let readed = join_all(tasks)

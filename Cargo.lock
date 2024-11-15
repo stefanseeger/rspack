@@ -4627,6 +4627,7 @@ dependencies = [
 name = "rspack_storage"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "futures",
  "itertools 0.13.0",
  "pollster",

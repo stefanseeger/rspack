@@ -3,10 +3,11 @@ use std::{
   sync::{Arc, Mutex},
 };
 
+use futures::channel::oneshot::Receiver;
 use rspack_error::Result;
 use rustc_hash::FxHashMap as HashMap;
 
-use super::{PackStorageFs, PackStorageOptions, ScopeManager};
+use super::{PackStorageFs, PackStorageOptions, PackStrategy, ScopeManager};
 use crate::Storage;
 
 pub type ScopeUpdates = HashMap<&'static str, HashMap<Vec<u8>, Option<Vec<u8>>>>;
@@ -18,9 +19,13 @@ pub struct PackStorage {
 
 impl PackStorage {
   pub fn new(root: PathBuf, temp: PathBuf, options: PackStorageOptions) -> Self {
-    let fs = PackStorageFs::new(root.clone(), temp.clone());
+    let strategy = Arc::new(PackStrategy::new(
+      root,
+      temp,
+      Arc::new(PackStorageFs::new()),
+    ));
     Self {
-      manager: Mutex::new(ScopeManager::new(root, options, fs)),
+      manager: Mutex::new(ScopeManager::new(options, strategy)),
       updates: Default::default(),
     }
   }
@@ -40,11 +45,9 @@ impl Storage for PackStorage {
     let scope_map = inner.entry(scope).or_default();
     scope_map.insert(key.to_vec(), None);
   }
-  fn idle(&self) -> Result<()> {
-    let updates = std::mem::replace(&mut *self.updates.lock().unwrap(), Default::default());
+  fn idle(&self) -> Result<Receiver<()>> {
+    let mut updates = std::mem::replace(&mut *self.updates.lock().unwrap(), Default::default());
     let mut manager = self.manager.lock().unwrap();
-    manager.update(updates);
-
-    Ok(())
+    manager.update(&mut updates)
   }
 }

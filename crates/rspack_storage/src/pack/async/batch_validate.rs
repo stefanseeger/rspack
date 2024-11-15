@@ -3,33 +3,35 @@ use std::{path::PathBuf, sync::Arc};
 use futures::{future::join_all, TryFutureExt};
 use rspack_error::{error, Result};
 
-use crate::pack::{get_pack_hash, PackKeys, PackStorageFs};
+use crate::pack::{PackContents, PackKeys, Strategy};
 
 pub struct PackValidateCandidate {
   pub path: PathBuf,
   pub hash: String,
   pub keys: PackKeys,
+  pub contents: PackContents,
 }
 
 pub fn validate_pack(
   hash: &str,
   path: &PathBuf,
   keys: &PackKeys,
-  fs: Arc<PackStorageFs>,
+  contents: &PackContents,
+  strategy: Arc<dyn Strategy>,
 ) -> Result<bool> {
-  let pack_hash = get_pack_hash(path, keys, fs)?;
+  let pack_hash = strategy.get_hash(path, keys, contents)?;
   Ok(*hash == pack_hash)
 }
 
 pub async fn batch_validate(
   candidates: Vec<PackValidateCandidate>,
-  fs: Arc<PackStorageFs>,
+  strategy: Arc<dyn Strategy>,
 ) -> Result<Vec<bool>> {
   let tasks = candidates.into_iter().map(|pack| {
-    let fs = fs.clone();
+    let strategy = strategy.clone();
     tokio::spawn(async move {
-      match validate_pack(&pack.hash, &pack.path, &pack.keys, fs) {
-        Ok(res) => res,
+      match strategy.get_hash(&pack.path, &pack.keys, &pack.contents) {
+        Ok(res) => pack.hash == res,
         Err(_) => false,
       }
     })

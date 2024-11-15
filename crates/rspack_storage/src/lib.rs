@@ -3,6 +3,7 @@ mod pack;
 
 use std::sync::Arc;
 
+use futures::channel::oneshot::Receiver;
 // pub use fs::FsStorage;
 pub use pack::{PackStorage, PackStorageOptions};
 use rspack_error::Result;
@@ -13,7 +14,7 @@ pub trait Storage: std::fmt::Debug + Sync + Send {
   // using immutable reference to support concurrency
   fn set(&self, scope: &'static str, key: Vec<u8>, value: Vec<u8>);
   fn remove(&self, scope: &'static str, key: &[u8]);
-  fn idle(&self) -> Result<()>;
+  fn idle(&self) -> Result<Receiver<()>>;
 }
 
 pub type ArcStorage = Arc<dyn Storage>;

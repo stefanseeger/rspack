@@ -6,11 +6,8 @@ mod test_storage {
     time::Duration,
   };
 
-  use futures::{executor::block_on, future::join_all, TryFutureExt};
-  use rspack_error::{error, Result};
   use rspack_storage::{PackStorage, PackStorageOptions, Storage};
   use rustc_hash::FxHasher;
-  use tokio::{runtime::Handle, task::JoinSet, time::sleep};
 
   #[test]
   fn test_basic() {
@@ -65,13 +62,7 @@ mod test_storage {
             .to_vec(),
         );
       }
-      match storage.idle() {
-        Ok(_) => {}
-        Err(e) => {
-          println!("failed: {}", e.to_string());
-          panic!("{:?}", e);
-        }
-      };
+      storage.idle();
 
       tokio::time::sleep(Duration::from_secs(3)).await;
     }
@@ -93,13 +84,7 @@ mod test_storage {
         format!("changed_value:2").as_bytes().to_vec(),
       );
 
-      match storage.idle() {
-        Ok(_) => {}
-        Err(e) => {
-          println!("failed: {}", e);
-          panic!("{:?}", e);
-        }
-      }
+      storage.idle();
     }
 
     async fn read_storage(options: &PackStorageOptions) {

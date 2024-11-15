@@ -1,16 +1,17 @@
 use std::{
-  collections::VecDeque,
   fmt::Debug,
-  sync::{Arc, Mutex},
+  future::Future,
+  sync::mpsc::{channel, Sender},
 };
 
-use futures::future::BoxFuture;
-use tokio::sync::mpsc::{self, UnboundedSender};
+use futures::{
+  channel::oneshot::{self, Receiver},
+  future::BoxFuture,
+  FutureExt,
+};
+use rspack_error::{error, Result};
 
-pub struct TaskQueue {
-  queue: Arc<Mutex<VecDeque<BoxFuture<'static, ()>>>>,
-  sender: UnboundedSender<()>,
-}
+pub struct TaskQueue(Sender<BoxFuture<'static, ()>>);
 
 impl Debug for TaskQueue {
   fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -20,26 +21,31 @@ impl Debug for TaskQueue {
 
 impl TaskQueue {
   pub fn new() -> Self {
-    let (sender, mut receiver) = mpsc::unbounded_channel();
-    let queue = Arc::new(Mutex::new(VecDeque::<BoxFuture<'static, ()>>::new()));
-    let queue_clone = queue.clone();
-
+    let (tx, rx) = channel();
     tokio::spawn(async move {
-      while receiver.recv().await.is_some() {
-        if let Some(task) = queue_clone.lock().unwrap().pop_front() {
-          tokio::spawn(task);
-        }
+      while let Ok(future) = rx.recv() {
+        future.await
       }
     });
 
-    TaskQueue { queue, sender }
+    Self(tx)
   }
 
-  pub fn add_task<F>(&self, task: F)
-  where
-    F: FnOnce() -> BoxFuture<'static, ()> + Send + 'static,
-  {
-    self.queue.lock().unwrap().push_back(task());
-    self.sender.send(()).unwrap();
+  pub fn add_task<F: Send + 'static>(
+    &self,
+    task: impl Future<Output = F> + Send + 'static,
+  ) -> Result<Receiver<F>> {
+    let (tx, rx) = oneshot::channel();
+    self
+      .0
+      .send(
+        async move {
+          let res = task.await;
+          let _ = tx.send(res);
+        }
+        .boxed(),
+      )
+      .map_err(|e| error!("{}", e))?;
+    Ok(rx)
   }
 }
