@@ -1,11 +1,7 @@
-use std::{hash::Hasher, path::PathBuf, sync::Arc};
-
-use rspack_error::Result;
-use rustc_hash::FxHasher;
-
-use crate::pack::{PackFileMeta, PackStorageFs, PackStorageOptions};
+use std::{path::PathBuf, sync::Arc};
 
 pub type PackKeys = Vec<Arc<Vec<u8>>>;
+pub type PackContents = Vec<Arc<Vec<u8>>>;
 
 #[derive(Debug, Default, Clone)]
 pub enum PackKeysState {
@@ -22,8 +18,6 @@ impl PackKeysState {
     }
   }
 }
-
-pub type PackContents = Vec<Arc<Vec<u8>>>;
 
 #[derive(Debug, Default, Clone)]
 pub enum PackContentsState {

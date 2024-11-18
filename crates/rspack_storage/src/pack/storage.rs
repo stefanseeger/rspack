@@ -7,7 +7,7 @@ use futures::channel::oneshot::Receiver;
 use rspack_error::Result;
 use rustc_hash::FxHashMap as HashMap;
 
-use super::{PackStorageFs, PackStorageOptions, PackStrategy, ScopeManager};
+use super::{PackNativeFileSystem, PackStorageOptions, ScopeManager, SplitPackStrategy};
 use crate::Storage;
 
 pub type ScopeUpdates = HashMap<&'static str, HashMap<Vec<u8>, Option<Vec<u8>>>>;
@@ -19,10 +19,10 @@ pub struct PackStorage {
 
 impl PackStorage {
   pub fn new(root: PathBuf, temp: PathBuf, options: PackStorageOptions) -> Self {
-    let strategy = Arc::new(PackStrategy::new(
+    let strategy = Arc::new(SplitPackStrategy::new(
       root,
       temp,
-      Arc::new(PackStorageFs::new()),
+      Arc::new(PackNativeFileSystem::default()),
     ));
     Self {
       manager: Mutex::new(ScopeManager::new(options, strategy)),
