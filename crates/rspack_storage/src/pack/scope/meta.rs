@@ -4,12 +4,13 @@ use std::{
   time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::PackStorageOptions;
+use crate::PackOptions;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct PackFileMeta {
   pub hash: String,
   pub name: String,
+  pub size: usize,
   pub writed: bool,
 }
 
@@ -21,13 +22,12 @@ pub struct ScopeMeta {
   pub last_modified: u64,
   pub packs: Vec<Vec<Arc<PackFileMeta>>>,
 }
-
 impl ScopeMeta {
-  pub fn new(dir: &PathBuf, options: Arc<PackStorageOptions>) -> Self {
+  pub fn new(dir: &PathBuf, options: &PackOptions) -> Self {
     Self {
       path: Self::get_path(dir),
-      buckets: options.buckets,
-      max_pack_size: options.max_pack_size,
+      buckets: options.buckets.clone(),
+      max_pack_size: options.max_pack_size.clone(),
       last_modified: SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("should get current time")

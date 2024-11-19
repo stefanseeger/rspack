@@ -55,4 +55,13 @@ impl Pack {
     matches!(self.keys, PackKeysState::Value(_))
       && matches!(self.contents, PackContentsState::Value(_))
   }
+
+  pub fn size(&self) -> usize {
+    self
+      .keys
+      .expect_value()
+      .iter()
+      .chain(self.contents.expect_value().iter())
+      .fold(0_usize, |acc, item| acc + item.len())
+  }
 }

@@ -45,7 +45,7 @@ async fn batch_read_keys(
 ) -> Result<Vec<PackKeys>> {
   let tasks = candidates.into_iter().map(|path| {
     let strategy = strategy.to_owned();
-    tokio::spawn(async move { strategy.read_keys(&path) }).map_err(|e| error!("{}", e))
+    tokio::spawn(async move { strategy.read_keys(&path).await }).map_err(|e| error!("{}", e))
   });
 
   let readed = join_all(tasks)
@@ -100,7 +100,7 @@ async fn batch_read_contents(
 ) -> Result<Vec<PackContents>> {
   let tasks = candidates.into_iter().map(|path| {
     let strategy = strategy.to_owned();
-    tokio::spawn(async move { strategy.read_contents(&path) }).map_err(|e| error!("{}", e))
+    tokio::spawn(async move { strategy.read_contents(&path).await }).map_err(|e| error!("{}", e))
   });
 
   let readed = join_all(tasks)
@@ -115,13 +115,13 @@ async fn batch_read_contents(
   Ok(res)
 }
 
-pub fn read_meta(scope: &PackScope) -> Result<ScopeMeta> {
+pub async fn read_meta(scope: &PackScope) -> Result<ScopeMeta> {
   let scope_path = ScopeMeta::get_path(&scope.path);
-  let meta = scope.strategy.read_scope_meta(&scope_path)?;
+  let meta = scope.strategy.read_scope_meta(&scope_path).await?;
   if let Some(meta) = meta {
     Ok(meta)
   } else {
-    Ok(ScopeMeta::new(&scope.path, scope.options.clone()))
+    Ok(ScopeMeta::new(&scope.path, &scope.options))
   }
 }
 

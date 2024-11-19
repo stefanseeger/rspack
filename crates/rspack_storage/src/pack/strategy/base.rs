@@ -11,7 +11,7 @@ use crate::{
   pack::{
     Pack, PackContents, PackContentsState, PackFileMeta, PackFs, PackKeys, PackKeysState, ScopeMeta,
   },
-  PackStorageOptions,
+  PackOptions,
 };
 
 #[derive(Debug, Clone)]
@@ -39,7 +39,7 @@ impl SplitPackStrategy {
 
     let tasks = candidates.into_iter().map(|(from, to)| {
       let fs = self.fs.clone();
-      tokio::spawn(async move { fs.move_file(&from, &to) }).map_err(|e| error!("{}", e))
+      tokio::spawn(async move { fs.move_file(&from, &to).await }).map_err(|e| error!("{}", e))
     });
 
     join_all(tasks)
@@ -53,7 +53,7 @@ impl SplitPackStrategy {
   async fn remove_files(&self, files: Vec<PathBuf>) -> Result<()> {
     let tasks = files.into_iter().map(|path| {
       let fs = self.fs.to_owned();
-      tokio::spawn(async move { fs.remove_file(&path) }).map_err(|e| error!("{}", e))
+      tokio::spawn(async move { fs.remove_file(&path).await }).map_err(|e| error!("{}", e))
     });
 
     join_all(tasks)
@@ -67,15 +67,16 @@ impl SplitPackStrategy {
 
 #[async_trait]
 impl Strategy for SplitPackStrategy {
-  fn read_scope_meta(&self, path: &PathBuf) -> Result<Option<ScopeMeta>> {
-    if !self.fs.exists(path)? {
+  async fn read_scope_meta(&self, path: &PathBuf) -> Result<Option<ScopeMeta>> {
+    if !self.fs.exists(path).await? {
       return Ok(None);
     }
 
-    let mut reader = self.fs.read_file(path)?;
+    let mut reader = self.fs.read_file(path).await?;
 
     let meta_options = reader
-      .line()?
+      .line()
+      .await?
       .split(" ")
       .map(|item| {
         item
@@ -97,17 +98,19 @@ impl Strategy for SplitPackStrategy {
     while bucket_id < buckets {
       packs.push(
         reader
-          .line()?
+          .line()
+          .await?
           .split(" ")
           .filter(|x| x.contains(","))
           .map(|x| x.split(",").collect::<Vec<_>>())
           .map(|info| {
-            if info.len() < 2 {
+            if info.len() < 3 {
               Err(error!("parse pack file info failed"))
             } else {
               Ok(Arc::new(PackFileMeta {
                 name: info[0].to_owned(),
                 hash: info[1].to_owned(),
+                size: info[2].parse::<usize>().expect("should parse pack size"),
                 writed: true,
               }))
             }
@@ -130,21 +133,24 @@ impl Strategy for SplitPackStrategy {
     }))
   }
 
-  fn write_scope_meta(&self, meta: &ScopeMeta) -> Result<()> {
+  async fn write_scope_meta(&self, meta: &ScopeMeta) -> Result<()> {
     let path = self.get_temp_path(&meta.path)?;
     self
       .fs
-      .ensure_dir(&PathBuf::from(path.parent().expect("should have parent")))?;
+      .ensure_dir(&PathBuf::from(path.parent().expect("should have parent")))
+      .await?;
 
-    let mut writer = self.fs.write_file(&path)?;
+    let mut writer = self.fs.write_file(&path).await?;
 
-    writer.line(
-      format!(
-        "{} {} {}",
-        meta.buckets, meta.max_pack_size, meta.last_modified
+    writer
+      .line(
+        format!(
+          "{} {} {}",
+          meta.buckets, meta.max_pack_size, meta.last_modified
+        )
+        .as_str(),
       )
-      .as_str(),
-    )?;
+      .await?;
 
     for bucket_id in 0..meta.buckets {
       let line = meta
@@ -157,16 +163,18 @@ impl Strategy for SplitPackStrategy {
             .join(" ")
         })
         .unwrap_or_default();
-      writer.line(&line)?;
+      writer.line(&line).await?;
     }
+
+    writer.flush().await?;
 
     Ok(())
   }
 
   async fn before_save(&self) -> Result<()> {
-    self.fs.remove_dir(&self.temp_root)?;
-    self.fs.ensure_dir(&self.temp_root)?;
-    self.fs.ensure_dir(&self.root)?;
+    self.fs.remove_dir(&self.temp_root).await?;
+    self.fs.ensure_dir(&self.temp_root).await?;
+    self.fs.ensure_dir(&self.root).await?;
     Ok(())
   }
 
@@ -178,7 +186,7 @@ impl Strategy for SplitPackStrategy {
     self.move_temp_files(writed_files).await?;
     self.remove_files(removed_files).await?;
 
-    self.fs.remove_dir(&self.temp_root)?;
+    self.fs.remove_dir(&self.temp_root).await?;
     // self.fs.clean_temporary()?;
     Ok(())
   }
@@ -194,22 +202,27 @@ impl Strategy for SplitPackStrategy {
     Ok(self.temp_root.join(relative_path))
   }
 
-  fn get_hash(&self, path: &PathBuf, keys: &PackKeys, contents: &PackContents) -> Result<String> {
+  async fn get_hash(
+    &self,
+    path: &PathBuf,
+    keys: &PackKeys,
+    contents: &PackContents,
+  ) -> Result<String> {
     let mut hasher = FxHasher::default();
     let file_name = get_name(keys, contents);
     hasher.write(file_name.as_bytes());
 
-    let meta = self.fs.read_file_meta(path)?;
+    let meta = self.fs.read_file_meta(path).await?;
     hasher.write_u64(meta.size);
-    hasher.write_i64(meta.mtime);
+    hasher.write_u64(meta.mtime);
 
     Ok(format!("{:016x}", hasher.finish()))
   }
 
-  fn create(
+  async fn create(
     &self,
     dir: &PathBuf,
-    options: Arc<PackStorageOptions>,
+    options: Arc<PackOptions>,
     items: &mut Vec<(Arc<Vec<u8>>, Arc<Vec<u8>>)>,
   ) -> Vec<(PackFileMeta, Pack)> {
     items.sort_unstable_by(|a, b| a.1.len().cmp(&b.1.len()));
@@ -225,6 +238,7 @@ impl Strategy for SplitPackStrategy {
         PackFileMeta {
           name: file_name,
           hash: Default::default(),
+          size: 0,
           writed: false,
         },
         new_pack,
@@ -281,12 +295,12 @@ impl Strategy for SplitPackStrategy {
     new_packs
   }
 
-  fn incremental(
+  async fn incremental(
     &self,
     dir: PathBuf,
-    options: Arc<PackStorageOptions>,
-    packs: &mut HashMap<Arc<PackFileMeta>, Pack>,
-    updates: &mut HashMap<Arc<Vec<u8>>, Option<Arc<Vec<u8>>>>,
+    options: Arc<PackOptions>,
+    mut packs: HashMap<Arc<PackFileMeta>, Pack>,
+    mut updates: HashMap<Arc<Vec<u8>>, Option<Arc<Vec<u8>>>>,
   ) -> PackIncrementalResult {
     let update_to_meta = packs
       .iter()
@@ -309,6 +323,12 @@ impl Strategy for SplitPackStrategy {
     // TODO: try to update pack
     // let mut updated_packs = HashSet::default();
     // let mut updated_keys = HashSet::default();
+
+    for (pack_meta, _) in packs.iter() {
+      if options.max_pack_size as f64 * 0.8_f64 > pack_meta.size as f64 {
+        removed_packs.insert(pack_meta.clone());
+      }
+    }
 
     for (dirty_key, dirty_value) in updates.iter() {
       if dirty_value.is_some() {
@@ -380,11 +400,11 @@ impl Strategy for SplitPackStrategy {
 
     let remain_packs = packs
       .into_iter()
-      .filter(|(meta, _)| !removed_packs.contains(*meta))
+      .filter(|(meta, _)| !removed_packs.contains(meta))
       .map(|(meta, pack)| (meta.clone(), pack.to_owned()))
       .collect::<Vec<_>>();
 
-    let new_packs: Vec<(PackFileMeta, Pack)> = self.create(&dir, options, &mut wait_items);
+    let new_packs: Vec<(PackFileMeta, Pack)> = self.create(&dir, options, &mut wait_items).await;
 
     PackIncrementalResult {
       new_packs,
@@ -393,89 +413,97 @@ impl Strategy for SplitPackStrategy {
     }
   }
 
-  fn write(&self, path: &PathBuf, keys: &PackKeys, contents: &PackContents) -> Result<()> {
+  async fn write(&self, path: &PathBuf, keys: &PackKeys, contents: &PackContents) -> Result<()> {
     let path = self.get_temp_path(path)?;
     self
       .fs
-      .ensure_dir(&PathBuf::from(path.parent().expect("should have parent")))?;
+      .ensure_dir(&PathBuf::from(path.parent().expect("should have parent")))
+      .await?;
 
-    let mut writer = self.fs.write_file(&path)?;
+    let mut writer = self.fs.write_file(&path).await?;
 
     // key meta line
-    writer.line(
-      keys
-        .iter()
-        .map(|key| key.len().to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .as_str(),
-    )?;
+    writer
+      .line(
+        keys
+          .iter()
+          .map(|key| key.len().to_string())
+          .collect::<Vec<_>>()
+          .join(" ")
+          .as_str(),
+      )
+      .await?;
 
     // content meta line
-    writer.line(
-      contents
-        .iter()
-        .map(|content| content.len().to_string())
-        .collect::<Vec<_>>()
-        .join(" ")
-        .as_str(),
-    )?;
+    writer
+      .line(
+        contents
+          .iter()
+          .map(|content| content.len().to_string())
+          .collect::<Vec<_>>()
+          .join(" ")
+          .as_str(),
+      )
+      .await?;
 
     for key in keys {
-      writer.bytes(key)?;
+      writer.bytes(key).await?;
     }
 
     for content in contents {
-      writer.bytes(content)?;
+      writer.bytes(content).await?;
     }
 
     Ok(())
   }
 
-  fn read_keys(&self, path: &PathBuf) -> Result<Option<PackKeys>> {
-    if !self.fs.exists(path)? {
+  async fn read_keys(&self, path: &PathBuf) -> Result<Option<PackKeys>> {
+    if !self.fs.exists(path).await? {
       return Ok(None);
     }
 
-    let mut reader = self.fs.read_file(path)?;
+    let mut reader = self.fs.read_file(path).await?;
     let key_meta_list: Vec<usize> = reader
-      .line()?
+      .line()
+      .await?
       .split(" ")
       .map(|item| item.parse::<usize>().expect("should have meta info"))
       .collect();
 
-    reader.line()?;
+    reader.line().await?;
 
     let mut keys = vec![];
     for len in key_meta_list {
-      keys.push(Arc::new(reader.bytes(len)?));
+      keys.push(Arc::new(reader.bytes(len).await?));
     }
     Ok(Some(keys))
   }
 
-  fn read_contents(&self, path: &PathBuf) -> Result<Option<PackContents>> {
-    if !self.fs.exists(path)? {
+  async fn read_contents(&self, path: &PathBuf) -> Result<Option<PackContents>> {
+    if !self.fs.exists(path).await? {
       return Ok(None);
     }
 
-    let mut reader = self.fs.read_file(path)?;
+    let mut reader = self.fs.read_file(path).await?;
     let total_key_size = reader
-      .line()?
+      .line()
+      .await?
       .split(" ")
       .map(|item| item.parse::<usize>().expect("should have meta info"))
       .fold(0_usize, |acc, key| acc + key);
 
     let content_meta_list: Vec<usize> = reader
-      .line()?
+      .line()
+      .await?
       .split(" ")
       .map(|item| item.parse::<usize>().expect("should have meta info"))
       .collect();
 
-    reader.skip(total_key_size)?;
+    reader.skip(total_key_size).await?;
 
     let mut res = vec![];
     for len in content_meta_list {
-      res.push(Arc::new(reader.bytes(len)?));
+      res.push(Arc::new(reader.bytes(len).await?));
     }
 
     Ok(Some(res))

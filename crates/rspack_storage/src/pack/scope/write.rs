@@ -12,7 +12,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use super::{PackFileMeta, PackScope, ScopeMetaState, ScopePacksState};
 use crate::pack::{Pack, Strategy};
 
-pub fn update_scope(
+pub async fn update_scope(
   scope: &mut PackScope,
   updates: HashMap<Vec<u8>, Option<Vec<u8>>>,
 ) -> Result<()> {
@@ -41,6 +41,7 @@ pub fn update_scope(
 
   // get dirty buckets
   let mut bucket_tasks = vec![];
+  let mut bucket_task_ids = vec![];
   for (dirty_bucket_id, dirty_items) in bucket_updates.into_iter() {
     let dirty_bucket_packs = {
       let mut packs = HashMap::default();
@@ -73,21 +74,19 @@ pub fn update_scope(
       packs
     };
 
-    bucket_tasks.push((dirty_bucket_id, dirty_bucket_packs, dirty_items));
+    bucket_tasks.push(scope.strategy.incremental(
+      scope.path.join(dirty_bucket_id.to_string()),
+      scope.options.clone(),
+      dirty_bucket_packs,
+      dirty_items,
+    ));
+    bucket_task_ids.push(dirty_bucket_id);
   }
 
   // generate dirty buckets
-  let dirty_bucket_results = bucket_tasks
-    .into_par_iter()
-    .map(|(bucket_id, mut bucket_packs, mut bucket_updates)| {
-      let bucket_res = scope.strategy.incremental(
-        scope.path.join(bucket_id.to_string()),
-        scope.options.clone(),
-        &mut bucket_packs,
-        &mut bucket_updates,
-      );
-      (bucket_id, bucket_res)
-    })
+  let dirty_bucket_results = bucket_task_ids
+    .into_iter()
+    .zip(join_all(bucket_tasks).await.into_iter())
     .collect::<HashMap<_, _>>();
 
   let mut total_files = HashSet::default();
@@ -152,11 +151,12 @@ pub async fn save_scope(scope: &mut PackScope) -> Result<ScopeSaveResult> {
   )
   .await?;
 
-  for ((_, meta), (hash, path)) in candidates.iter_mut().zip(write_results.into_iter()) {
+  for ((_, meta), (hash, path, size)) in candidates.iter_mut().zip(write_results.into_iter()) {
     let _ = std::mem::replace(
       *meta,
       Arc::new(PackFileMeta {
         hash,
+        size,
         name: meta.name.clone(),
         writed: true,
       }),
@@ -166,7 +166,7 @@ pub async fn save_scope(scope: &mut PackScope) -> Result<ScopeSaveResult> {
 
   let meta = scope.meta.expect_value();
   writed_files.insert(meta.path.clone());
-  scope.strategy.write_scope_meta(&meta)?;
+  scope.strategy.write_scope_meta(&meta).await?;
 
   Ok(ScopeSaveResult {
     writed_files,
@@ -174,21 +174,23 @@ pub async fn save_scope(scope: &mut PackScope) -> Result<ScopeSaveResult> {
   })
 }
 
-async fn save_pack(pack: Pack, strategy: Arc<dyn Strategy>) -> Result<(String, PathBuf)> {
+async fn save_pack(pack: Pack, strategy: Arc<dyn Strategy>) -> Result<(String, PathBuf, usize)> {
   let keys = pack.keys.expect_value();
   let contents = pack.contents.expect_value();
   if keys.len() != contents.len() {
     return Err(error!("pack keys and contents length not match"));
   }
-  strategy.write(&pack.path, keys, contents)?;
-  let hash = strategy.get_hash(&strategy.get_temp_path(&pack.path)?, keys, contents)?;
-  Ok((hash, pack.path.clone()))
+  strategy.write(&pack.path, keys, contents).await?;
+  let hash = strategy
+    .get_hash(&strategy.get_temp_path(&pack.path)?, keys, contents)
+    .await?;
+  Ok((hash, pack.path.clone(), pack.size()))
 }
 
 async fn batch_write_packs(
   packs: Vec<Pack>,
   strategy: Arc<dyn Strategy>,
-) -> Result<Vec<(String, PathBuf)>> {
+) -> Result<Vec<(String, PathBuf, usize)>> {
   let tasks = packs.into_iter().map(|pack| {
     let strategy = strategy.clone();
     tokio::spawn(async move { save_pack(pack, strategy).await }).map_err(|e| error!("{}", e))
@@ -197,7 +199,7 @@ async fn batch_write_packs(
   let writed = join_all(tasks)
     .await
     .into_iter()
-    .collect::<Result<Vec<Result<(String, PathBuf)>>>>()?;
+    .collect::<Result<Vec<Result<(String, PathBuf, usize)>>>>()?;
 
   let mut res = vec![];
   for item in writed {

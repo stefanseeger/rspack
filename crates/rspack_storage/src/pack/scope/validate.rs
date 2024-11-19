@@ -13,7 +13,7 @@ use tokio::task::unconstrained;
 use super::{get_pack_meta_pairs, PackScope};
 use crate::{
   pack::{PackContents, PackKeys, Strategy},
-  PackStorageOptions,
+  PackOptions,
 };
 
 #[derive(Debug)]
@@ -30,7 +30,7 @@ pub struct ValidatingPack {
   pub contents: PackContents,
 }
 
-pub fn validate_meta(scope: &PackScope, options: &PackStorageOptions) -> Result<ValidateResult> {
+pub fn validate_meta(scope: &PackScope, options: &PackOptions) -> Result<ValidateResult> {
   let meta = scope.meta.expect_value();
   if meta.buckets != options.buckets || meta.max_pack_size != options.max_pack_size {
     return Ok(ValidateResult::Invalid("scope options changed".to_string()));
@@ -76,7 +76,10 @@ async fn batch_validate_packs(
   let tasks = candidates.into_iter().map(|pack| {
     let strategy = strategy.clone();
     tokio::spawn(async move {
-      match strategy.get_hash(&pack.path, &pack.keys, &pack.contents) {
+      match strategy
+        .get_hash(&pack.path, &pack.keys, &pack.contents)
+        .await
+      {
         Ok(res) => pack.hash == res,
         Err(_) => false,
       }

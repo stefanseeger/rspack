@@ -15,6 +15,8 @@ itertools = {workspace = true}
 pollster = {workspace = true}
 rayon = {workspace = true}
 rspack_error = {version = "0.1.0", path = "../rspack_error"}
+rspack_fs = {version = "0.1.0", path = "../rspack_fs"}
+rspack_paths = {version = "0.1.0", path = "../rspack_paths"}
 rustc-hash = {workspace = true}
 tokio = {workspace = true, features = ["rt", "rt-multi-thread", "macros", "test-util", "parking_lot", "fs"]}
 

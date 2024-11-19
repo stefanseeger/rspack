@@ -4633,6 +4633,8 @@ dependencies = [
  "pollster",
  "rayon",
  "rspack_error",
+ "rspack_fs",
+ "rspack_paths",
  "rustc-hash 1.1.0",
  "tokio",
 ]

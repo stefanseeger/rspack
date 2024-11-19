@@ -8,7 +8,7 @@ use super::{
   read_contents, read_keys, read_meta, read_packs, save_scope, update_scope, validate_meta,
   validate_packs, ScopeSaveResult, ValidateResult,
 };
-use crate::pack::{Pack, PackContentsState, PackStorageOptions, ScopeMeta};
+use crate::pack::{Pack, PackContentsState, PackOptions, ScopeMeta};
 use crate::pack::{PackKeysState, Strategy};
 
 #[derive(Debug, Default, Clone)]
@@ -72,7 +72,7 @@ impl ScopePacksState {
 #[derive(Debug, Clone)]
 pub struct PackScope {
   pub path: Arc<PathBuf>,
-  pub options: Arc<PackStorageOptions>,
+  pub options: Arc<PackOptions>,
   pub meta: ScopeMetaState,
   pub packs: ScopePacksState,
   pub removed: HashSet<PathBuf>,
@@ -80,11 +80,7 @@ pub struct PackScope {
 }
 
 impl PackScope {
-  pub fn new(
-    name: &'static str,
-    options: Arc<PackStorageOptions>,
-    strategy: Arc<dyn Strategy>,
-  ) -> Self {
+  pub fn new(name: &'static str, options: Arc<PackOptions>, strategy: Arc<dyn Strategy>) -> Self {
     Self {
       path: Arc::new(strategy.get_path(name)),
       options,
@@ -95,13 +91,9 @@ impl PackScope {
     }
   }
 
-  pub fn empty(
-    name: &'static str,
-    options: Arc<PackStorageOptions>,
-    strategy: Arc<dyn Strategy>,
-  ) -> Self {
+  pub fn empty(name: &'static str, options: Arc<PackOptions>, strategy: Arc<dyn Strategy>) -> Self {
     let scope_path = strategy.get_path(name);
-    let meta = ScopeMeta::new(&scope_path, options.clone());
+    let meta = ScopeMeta::new(&scope_path, &options);
     let packs = vec![vec![]; options.buckets];
 
     Self {
@@ -125,8 +117,8 @@ impl PackScope {
         .all(|pack| pack.loaded())
   }
 
-  pub fn get_contents(&mut self) -> Result<Vec<(Arc<Vec<u8>>, Arc<Vec<u8>>)>> {
-    self.ensure_pack_contents()?;
+  pub async fn get_contents(&mut self) -> Result<Vec<(Arc<Vec<u8>>, Arc<Vec<u8>>)>> {
+    self.ensure_pack_contents().await?;
 
     Ok(
       self
@@ -155,36 +147,36 @@ impl PackScope {
     )
   }
 
-  pub fn validate(&mut self, options: &PackStorageOptions) -> Result<ValidateResult> {
-    self.ensure_meta()?;
+  pub async fn validate(&mut self, options: &PackOptions) -> Result<ValidateResult> {
+    self.ensure_meta().await?;
 
     let is_meta_valid = validate_meta(&self, &options)?;
 
     if matches!(is_meta_valid, ValidateResult::Valid) {
-      self.ensure_pack_keys()?;
+      self.ensure_pack_keys().await?;
       validate_packs(&self)
     } else {
       Ok(is_meta_valid)
     }
   }
 
-  fn ensure_meta(&mut self) -> Result<()> {
+  async fn ensure_meta(&mut self) -> Result<()> {
     if matches!(self.meta, ScopeMetaState::Pending) {
-      self.meta = ScopeMetaState::Value(read_meta(&self)?);
+      self.meta = ScopeMetaState::Value(read_meta(&self).await?);
     }
     Ok(())
   }
 
-  fn ensure_packs(&mut self) -> Result<()> {
-    self.ensure_meta()?;
+  async fn ensure_packs(&mut self) -> Result<()> {
+    self.ensure_meta().await?;
     if matches!(self.packs, ScopePacksState::Pending) {
       self.packs = ScopePacksState::Value(read_packs(&self)?);
     }
     Ok(())
   }
 
-  fn ensure_pack_keys(&mut self) -> Result<()> {
-    self.ensure_packs()?;
+  async fn ensure_pack_keys(&mut self) -> Result<()> {
+    self.ensure_packs().await?;
 
     let packs_results = read_keys(&self)?;
     let packs = self.packs.expect_value_mut();
@@ -199,8 +191,8 @@ impl PackScope {
     Ok(())
   }
 
-  fn ensure_pack_contents(&mut self) -> Result<()> {
-    self.ensure_pack_keys()?;
+  async fn ensure_pack_contents(&mut self) -> Result<()> {
+    self.ensure_pack_keys().await?;
 
     let packs_results = read_contents(&self)?;
     let packs = self.packs.expect_value_mut();
@@ -215,11 +207,11 @@ impl PackScope {
     Ok(())
   }
 
-  pub fn update(&mut self, updates: HashMap<Vec<u8>, Option<Vec<u8>>>) -> Result<()> {
+  pub async fn update(&mut self, updates: HashMap<Vec<u8>, Option<Vec<u8>>>) -> Result<()> {
     if !self.loaded() {
       return Err(error!("scope not loaded, run `get_all` first"));
     }
-    update_scope(self, updates)
+    update_scope(self, updates).await
   }
 
   pub async fn save(&mut self) -> Result<ScopeSaveResult> {

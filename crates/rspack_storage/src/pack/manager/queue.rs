@@ -4,12 +4,7 @@ use std::{
   sync::mpsc::{channel, Sender},
 };
 
-use futures::{
-  channel::oneshot::{self, Receiver},
-  future::BoxFuture,
-  FutureExt,
-};
-use rspack_error::{error, Result};
+use futures::{future::BoxFuture, FutureExt};
 
 pub struct TaskQueue(Sender<BoxFuture<'static, ()>>);
 
@@ -31,21 +26,10 @@ impl TaskQueue {
     Self(tx)
   }
 
-  pub fn add_task<F: Send + 'static>(
-    &self,
-    task: impl Future<Output = F> + Send + 'static,
-  ) -> Result<Receiver<F>> {
-    let (tx, rx) = oneshot::channel();
+  pub fn add_task(&self, task: impl Future<Output = ()> + Send + 'static) {
     self
       .0
-      .send(
-        async move {
-          let res = task.await;
-          let _ = tx.send(res);
-        }
-        .boxed(),
-      )
-      .map_err(|e| error!("{}", e))?;
-    Ok(rx)
+      .send(async move { task.await }.boxed())
+      .expect("should add task");
   }
 }
