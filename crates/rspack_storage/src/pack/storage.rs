@@ -7,7 +7,7 @@ use rspack_error::Result;
 use rustc_hash::FxHashMap as HashMap;
 use tokio::sync::oneshot::Receiver;
 
-use super::{PackFs, PackMemoryFs, PackNativeFs, PackOptions, ScopeManager, SplitPackStrategy};
+use super::{PackFs, PackOptions, ScopeManager, SplitPackStrategy};
 use crate::Storage;
 
 pub type ScopeUpdates = HashMap<&'static str, HashMap<Vec<u8>, Option<Vec<u8>>>>;
@@ -17,15 +17,10 @@ pub struct PackStorage {
   updates: Mutex<ScopeUpdates>,
 }
 
-pub enum PackFsType {
-  Memory,
-  Native,
-}
-
 pub struct PackStorageOptions {
   root: PathBuf,
   temp_root: PathBuf,
-  fs: PackFsType,
+  fs: Arc<dyn PackFs>,
   buckets: usize,
   max_pack_size: usize,
   expires: u64,
@@ -33,14 +28,11 @@ pub struct PackStorageOptions {
 
 impl PackStorage {
   pub fn new(options: PackStorageOptions) -> Self {
-    let fs: Arc<dyn PackFs> = if matches!(options.fs, PackFsType::Native) {
-      Arc::new(PackNativeFs::default())
-    } else if matches!(options.fs, PackFsType::Memory) {
-      Arc::new(PackMemoryFs::default())
-    } else {
-      panic!("invalid fs type")
-    };
-    let strategy = Arc::new(SplitPackStrategy::new(options.root, options.temp_root, fs));
+    let strategy = Arc::new(SplitPackStrategy::new(
+      options.root,
+      options.temp_root,
+      options.fs,
+    ));
     Self {
       manager: ScopeManager::new(
         PackOptions {
