@@ -1,130 +1,140 @@
 use std::{path::PathBuf, sync::Arc};
 
+use async_trait::async_trait;
 use futures::{future::join_all, TryFutureExt};
 use itertools::Itertools;
 use rspack_error::{error, Result};
 
-use super::{PackFileMeta, PackScope, ScopeMeta, ScopePacks};
-use crate::pack::{Pack, PackContents, PackContentsState, PackKeys, PackKeysState, Strategy};
+use super::{util::get_pack_meta_pairs, SplitPackStrategy};
+use crate::pack::{
+  Pack, PackContents, PackContentsState, PackFileMeta, PackFs, PackKeys, PackKeysState,
+  PackReadStrategy, PackScope, ScopeMeta, ScopeMetaState, ScopePacks, ScopePacksState,
+  ScopeReadStrategy,
+};
 
-#[derive(Debug)]
-pub struct ReadKeysResult {
-  pub bucket_id: usize,
-  pub pack_pos: usize,
-  pub keys: PackKeys,
-}
-
-pub async fn read_keys(scope: &PackScope) -> Result<Vec<ReadKeysResult>> {
-  let candidates = get_pack_meta_pairs(scope)?
-    .into_iter()
-    .filter(|(_, _, _, pack)| matches!(pack.keys, PackKeysState::Pending))
-    .map(|args| (args.0, args.1, args.3.path.to_owned()))
-    .collect_vec();
-  let readed = batch_read_keys(
-    candidates.iter().map(|i| i.2.to_owned()).collect_vec(),
-    scope.strategy.clone(),
-  )
-  .await?;
-
-  Ok(
-    readed
-      .into_iter()
-      .zip(candidates.into_iter())
-      .map(|(keys, (bucket_id, pack_pos, _))| ReadKeysResult {
-        bucket_id,
-        pack_pos,
-        keys,
-      })
-      .collect_vec(),
-  )
-}
-
-async fn batch_read_keys(
-  candidates: Vec<PathBuf>,
-  strategy: Arc<dyn Strategy>,
-) -> Result<Vec<PackKeys>> {
-  let tasks = candidates.into_iter().map(|path| {
-    let strategy = strategy.to_owned();
-    tokio::spawn(async move { strategy.read_keys(&path).await }).map_err(|e| error!("{}", e))
-  });
-
-  let readed = join_all(tasks)
-    .await
-    .into_iter()
-    .collect::<Result<Vec<Result<Option<PackKeys>>>>>()?;
-
-  let mut res = vec![];
-  for keys in readed {
-    res.push(keys?.unwrap_or_default());
+#[async_trait]
+impl ScopeReadStrategy for SplitPackStrategy {
+  async fn ensure_meta(&self, scope: &mut PackScope) -> Result<()> {
+    if matches!(scope.meta, ScopeMetaState::Pending) {
+      let scope_path = ScopeMeta::get_path(&scope.path);
+      let meta = read_scope_meta(&scope_path, self.fs.clone())
+        .await?
+        .unwrap_or_else(|| ScopeMeta::new(&scope.path, &scope.options));
+      scope.meta = ScopeMetaState::Value(meta);
+    }
+    Ok(())
   }
-  Ok(res)
-}
 
-#[derive(Debug)]
-pub struct ReadContentsResult {
-  pub bucket_id: usize,
-  pub pack_pos: usize,
-  pub contents: PackContents,
-}
+  async fn ensure_packs(&self, scope: &mut PackScope) -> Result<()> {
+    self.ensure_meta(scope).await?;
 
-pub async fn read_contents(scope: &PackScope) -> Result<Vec<ReadContentsResult>> {
-  let candidates = get_pack_meta_pairs(scope)?
-    .into_iter()
-    .filter(|(_, _, _, pack)| matches!(pack.contents, PackContentsState::Pending))
-    .map(|args| (args.0, args.1, args.3.path.to_owned()))
-    .collect_vec();
-
-  let readed: Vec<Vec<Arc<Vec<u8>>>> = batch_read_contents(
-    candidates.iter().map(|i| i.2.to_owned()).collect_vec(),
-    scope.strategy.clone(),
-  )
-  .await?;
-
-  Ok(
-    readed
-      .into_iter()
-      .zip(candidates.into_iter())
-      .map(|(contents, (bucket_id, pack_pos, _))| ReadContentsResult {
-        bucket_id,
-        pack_pos,
-        contents,
-      })
-      .collect_vec(),
-  )
-}
-
-async fn batch_read_contents(
-  candidates: Vec<PathBuf>,
-  strategy: Arc<dyn Strategy>,
-) -> Result<Vec<PackContents>> {
-  let tasks = candidates.into_iter().map(|path| {
-    let strategy = strategy.to_owned();
-    tokio::spawn(async move { strategy.read_contents(&path).await }).map_err(|e| error!("{}", e))
-  });
-
-  let readed = join_all(tasks)
-    .await
-    .into_iter()
-    .collect::<Result<Vec<Result<Option<PackContents>>>>>()?;
-
-  let mut res = vec![];
-  for contents in readed {
-    res.push(contents?.unwrap_or_default());
+    if matches!(scope.packs, ScopePacksState::Pending) {
+      scope.packs = ScopePacksState::Value(read_packs(&scope).await?);
+    }
+    Ok(())
   }
-  Ok(res)
-}
 
-pub async fn read_meta(scope: &PackScope) -> Result<ScopeMeta> {
-  let scope_path = ScopeMeta::get_path(&scope.path);
-  let meta = scope.strategy.read_scope_meta(&scope_path).await?;
-  if let Some(meta) = meta {
-    Ok(meta)
-  } else {
-    Ok(ScopeMeta::new(&scope.path, &scope.options))
+  async fn ensure_keys(&self, scope: &mut PackScope) -> Result<()> {
+    self.ensure_packs(scope).await?;
+
+    let packs_results = read_keys(&scope, self).await?;
+    let packs = scope.packs.expect_value_mut();
+    for pack_res in packs_results {
+      if let Some(pack) = packs
+        .get_mut(pack_res.bucket_id)
+        .and_then(|packs| packs.get_mut(pack_res.pack_pos))
+      {
+        pack.keys = PackKeysState::Value(pack_res.keys);
+      }
+    }
+    Ok(())
+  }
+
+  async fn ensure_contents(&self, scope: &mut PackScope) -> Result<()> {
+    self.ensure_keys(scope).await?;
+
+    let packs_results = read_contents(&scope, self).await?;
+    let packs = scope.packs.expect_value_mut();
+    for pack_res in packs_results {
+      if let Some(pack) = packs
+        .get_mut(pack_res.bucket_id)
+        .and_then(|packs| packs.get_mut(pack_res.pack_pos))
+      {
+        pack.contents = PackContentsState::Value(pack_res.contents);
+      }
+    }
+    Ok(())
+  }
+
+  fn get_path(&self, str: &str) -> PathBuf {
+    self.root.join(str)
   }
 }
 
-pub async fn read_packs(scope: &PackScope) -> Result<ScopePacks> {
+async fn read_scope_meta(path: &PathBuf, fs: Arc<dyn PackFs>) -> Result<Option<ScopeMeta>> {
+  if !fs.exists(path).await? {
+    return Ok(None);
+  }
+
+  let mut reader = fs.read_file(path).await?;
+
+  let meta_options = reader
+    .line()
+    .await?
+    .split(" ")
+    .map(|item| {
+      item
+        .parse::<usize>()
+        .map_err(|e| error!("parse meta file failed: {}", e))
+    })
+    .collect::<Result<Vec<usize>>>()?;
+
+  if meta_options.len() < 3 {
+    return Err(error!("meta broken"));
+  }
+
+  let buckets = meta_options[0];
+  let max_pack_size = meta_options[1];
+  let last_modified = meta_options[2] as u64;
+
+  let mut packs = vec![];
+  for _ in 0..buckets {
+    packs.push(
+      reader
+        .line()
+        .await?
+        .split(" ")
+        .map(|i| i.split(",").collect::<Vec<_>>())
+        .map(|i| {
+          if i.len() < 3 {
+            Err(error!("parse pack file info failed"))
+          } else {
+            Ok(Arc::new(PackFileMeta {
+              name: i[0].to_owned(),
+              hash: i[1].to_owned(),
+              size: i[2].parse::<usize>().expect("should parse pack size"),
+              writed: true,
+            }))
+          }
+        })
+        .collect::<Result<Vec<Arc<PackFileMeta>>>>()?,
+    );
+  }
+
+  if packs.len() < buckets {
+    return Err(error!("parse meta buckets failed"));
+  }
+
+  Ok(Some(ScopeMeta {
+    path: path.clone(),
+    buckets,
+    max_pack_size,
+    last_modified,
+    packs,
+  }))
+}
+
+async fn read_packs(scope: &PackScope) -> Result<ScopePacks> {
   Ok(
     scope
       .meta
@@ -143,35 +153,115 @@ pub async fn read_packs(scope: &PackScope) -> Result<ScopePacks> {
   )
 }
 
-pub fn get_pack_meta_pairs(
-  scope: &PackScope,
-) -> Result<Vec<(usize, usize, Arc<PackFileMeta>, &Pack)>> {
-  let meta = scope.meta.expect_value();
-  let packs = scope.packs.expect_value();
+#[derive(Debug)]
+struct ReadKeysResult {
+  pub bucket_id: usize,
+  pub pack_pos: usize,
+  pub keys: PackKeys,
+}
+
+async fn read_keys(scope: &PackScope, strategy: &SplitPackStrategy) -> Result<Vec<ReadKeysResult>> {
+  let candidates = get_pack_meta_pairs(scope)?
+    .into_iter()
+    .filter(|(_, _, _, pack)| matches!(pack.keys, PackKeysState::Pending))
+    .map(|args| (args.0, args.1, args.3.path.to_owned()))
+    .collect_vec();
+  let readed = batch_read_keys(
+    candidates.iter().map(|i| i.2.to_owned()).collect_vec(),
+    strategy,
+  )
+  .await?;
 
   Ok(
-    meta
-      .packs
-      .iter()
-      .enumerate()
-      .map(|(bucket_id, pack_meta_list)| {
-        let bucket_packs = packs.get(bucket_id).expect("should have bucket packs");
-        pack_meta_list
-          .iter()
-          .enumerate()
-          .map(|(pack_pos, pack_meta)| {
-            (
-              bucket_id,
-              pack_pos,
-              pack_meta.clone(),
-              bucket_packs.get(pack_pos).expect("should have bucket pack"),
-            )
-          })
-          .collect_vec()
+    readed
+      .into_iter()
+      .zip(candidates.into_iter())
+      .map(|(keys, (bucket_id, pack_pos, _))| ReadKeysResult {
+        bucket_id,
+        pack_pos,
+        keys,
       })
-      .flatten()
       .collect_vec(),
   )
+}
+
+async fn batch_read_keys(
+  candidates: Vec<PathBuf>,
+  strategy: &SplitPackStrategy,
+) -> Result<Vec<PackKeys>> {
+  let tasks = candidates.into_iter().map(|path| {
+    let strategy = strategy.to_owned();
+    tokio::spawn(async move { strategy.read_pack_keys(&path).await }).map_err(|e| error!("{}", e))
+  });
+
+  let readed = join_all(tasks)
+    .await
+    .into_iter()
+    .collect::<Result<Vec<Result<Option<PackKeys>>>>>()?;
+
+  let mut res = vec![];
+  for keys in readed {
+    res.push(keys?.unwrap_or_default());
+  }
+  Ok(res)
+}
+
+#[derive(Debug)]
+struct ReadContentsResult {
+  pub bucket_id: usize,
+  pub pack_pos: usize,
+  pub contents: PackContents,
+}
+
+async fn read_contents(
+  scope: &PackScope,
+  strategy: &SplitPackStrategy,
+) -> Result<Vec<ReadContentsResult>> {
+  let candidates = get_pack_meta_pairs(scope)?
+    .into_iter()
+    .filter(|(_, _, _, pack)| matches!(pack.contents, PackContentsState::Pending))
+    .map(|args| (args.0, args.1, args.3.path.to_owned()))
+    .collect_vec();
+
+  let readed: Vec<Vec<Arc<Vec<u8>>>> = batch_read_contents(
+    candidates.iter().map(|i| i.2.to_owned()).collect_vec(),
+    strategy,
+  )
+  .await?;
+
+  Ok(
+    readed
+      .into_iter()
+      .zip(candidates.into_iter())
+      .map(|(contents, (bucket_id, pack_pos, _))| ReadContentsResult {
+        bucket_id,
+        pack_pos,
+        contents,
+      })
+      .collect_vec(),
+  )
+}
+
+async fn batch_read_contents(
+  candidates: Vec<PathBuf>,
+  strategy: &SplitPackStrategy,
+) -> Result<Vec<PackContents>> {
+  let tasks = candidates.into_iter().map(|path| {
+    let strategy = strategy.to_owned();
+    tokio::spawn(async move { strategy.read_pack_contents(&path).await })
+      .map_err(|e| error!("{}", e))
+  });
+
+  let readed = join_all(tasks)
+    .await
+    .into_iter()
+    .collect::<Result<Vec<Result<Option<PackContents>>>>>()?;
+
+  let mut res = vec![];
+  for contents in readed {
+    res.push(contents?.unwrap_or_default());
+  }
+  Ok(res)
 }
 
 #[cfg(test)]
@@ -187,11 +277,10 @@ mod tests {
   use itertools::Itertools;
   use rspack_error::Result;
 
-  use super::{read_keys, read_meta, read_packs};
   use crate::{
     pack::{
-      read_contents, PackFileMeta, PackFs, PackMemoryFs, PackScope, ScopeMeta, ScopeMetaState,
-      ScopePacksState, SplitPackStrategy, Strategy,
+      PackFileMeta, PackFs, PackMemoryFs, PackScope, ScopeMeta, ScopeReadStrategy,
+      SplitPackStrategy,
     },
     PackOptions,
   };
@@ -263,8 +352,9 @@ mod tests {
     Ok(())
   }
 
-  async fn test_read_meta(scope: &mut PackScope) -> Result<()> {
-    let meta = read_meta(scope).await?;
+  async fn test_read_meta(scope: &mut PackScope, strategy: &SplitPackStrategy) -> Result<()> {
+    strategy.ensure_meta(scope).await?;
+    let meta = scope.meta.expect_value();
     assert_eq!(meta.path, ScopeMeta::get_path(scope.path.as_ref()));
     assert_eq!(meta.buckets, scope.options.buckets);
     assert_eq!(meta.max_pack_size, scope.options.max_pack_size);
@@ -298,25 +388,18 @@ mod tests {
       ]
     );
 
-    scope.meta = ScopeMetaState::Value(meta);
-
     Ok(())
   }
 
-  async fn test_read_packs(scope: &mut PackScope) -> Result<()> {
-    let packs = read_packs(scope).await?;
-    assert_eq!(packs.len(), scope.options.buckets);
-    scope.packs = ScopePacksState::Value(packs);
+  async fn test_read_packs(scope: &mut PackScope, strategy: &SplitPackStrategy) -> Result<()> {
+    strategy.ensure_keys(scope).await?;
 
-    let keys = read_keys(scope).await?;
-    assert_eq!(
-      keys.len(),
-      scope.packs.expect_value().iter().flatten().count()
-    );
-
-    let all_keys = keys
+    let all_keys = scope
+      .packs
+      .expect_value()
       .into_iter()
-      .map(|item| item.keys)
+      .flatten()
+      .map(|pack| pack.keys.expect_value().to_owned())
       .flatten()
       .collect::<HashSet<_>>();
     assert!(all_keys.contains(
@@ -325,15 +408,14 @@ mod tests {
         .to_vec()
     ));
 
-    let contents = read_contents(scope).await?;
-    assert_eq!(
-      contents.len(),
-      scope.packs.expect_value().iter().flatten().count()
-    );
+    strategy.ensure_contents(scope).await?;
 
-    let all_contents = contents
+    let all_contents = scope
+      .packs
+      .expect_value()
       .into_iter()
-      .map(|item| item.contents)
+      .flatten()
+      .map(|pack| pack.contents.expect_value().to_owned())
       .flatten()
       .collect::<HashSet<_>>();
     assert!(all_contents.contains(
@@ -345,7 +427,7 @@ mod tests {
     Ok(())
   }
 
-  async fn clean_scope_path(scope: &PackScope, strategy: Arc<dyn Strategy>, fs: Arc<dyn PackFs>) {
+  async fn clean_scope_path(scope: &PackScope, strategy: &SplitPackStrategy, fs: Arc<dyn PackFs>) {
     fs.remove_dir(&scope.path).await.expect("should remove dir");
     fs.remove_dir(
       &strategy
@@ -359,18 +441,15 @@ mod tests {
   #[tokio::test]
   async fn should_read_scope() {
     let fs = Arc::new(PackMemoryFs::default());
-    let strategy = Arc::new(SplitPackStrategy::new(
-      PathBuf::from("/cache"),
-      PathBuf::from("/temp"),
-      fs.clone(),
-    ));
+    let strategy =
+      SplitPackStrategy::new(PathBuf::from("/cache"), PathBuf::from("/temp"), fs.clone());
     let options = Arc::new(PackOptions {
       buckets: 1,
       max_pack_size: 16,
       expires: 60000,
     });
-    let mut scope = PackScope::new("test_read_meta", options.clone(), strategy.clone());
-    clean_scope_path(&scope, strategy.clone(), fs.clone()).await;
+    let mut scope = PackScope::new(PathBuf::from("/cache/test_read_meta"), options.clone());
+    clean_scope_path(&scope, &strategy, fs.clone()).await;
 
     mock_meta(
       &ScopeMeta::get_path(scope.path.as_ref()),
@@ -384,10 +463,10 @@ mod tests {
       .await
       .expect("should mock packs");
 
-    let _ = test_read_meta(&mut scope).await.map_err(|e| {
+    let _ = test_read_meta(&mut scope, &strategy).await.map_err(|e| {
       panic!("{}", e);
     });
-    let _ = test_read_packs(&mut scope).await.map_err(|e| {
+    let _ = test_read_packs(&mut scope, &strategy).await.map_err(|e| {
       panic!("{}", e);
     });
   }

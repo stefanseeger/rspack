@@ -40,7 +40,7 @@ mod tests {
 
   use tokio::sync::{oneshot, Mutex};
 
-  use crate::pack::TaskQueue;
+  use crate::pack::manager::queue::TaskQueue;
 
   async fn test_task_queue() {
     let queue = TaskQueue::new();

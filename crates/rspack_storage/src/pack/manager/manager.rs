@@ -7,22 +7,22 @@ use rustc_hash::FxHashMap as HashMap;
 use tokio::sync::oneshot::Receiver;
 use tokio::sync::{oneshot, Mutex};
 
-use super::TaskQueue;
-use crate::pack::{PackScope, ScopeSaveResult, Strategy, ValidateResult};
+use super::queue::TaskQueue;
+use crate::pack::{PackScope, Strategy, ValidateResult, WriteScopeResult};
 use crate::{pack::ScopeUpdates, PackOptions};
 
 type ScopeMap = HashMap<&'static str, PackScope>;
 
 #[derive(Debug)]
 pub struct ScopeManager {
-  pub strategy: Arc<dyn Strategy>,
+  pub strategy: Arc<Box<dyn Strategy>>,
   pub options: Arc<PackOptions>,
   pub scopes: Arc<Mutex<ScopeMap>>,
   pub queue: TaskQueue,
 }
 
 impl ScopeManager {
-  pub fn new(options: PackOptions, strategy: Arc<dyn Strategy>) -> Self {
+  pub fn new(options: PackOptions, strategy: Arc<Box<dyn Strategy>>) -> Self {
     ScopeManager {
       strategy,
       options: Arc::new(options),
@@ -38,7 +38,7 @@ impl ScopeManager {
     let (tx, rx) = oneshot::channel();
     self.queue.add_task(Box::pin(async move {
       let scopes = std::mem::take(&mut *scopes.lock().await);
-      let _ = match save_scopes(scopes, updates, options, strategy).await {
+      let _ = match save_scopes(scopes, updates, options, strategy.as_ref()).await {
         Ok(_) => tx.send(Ok(())),
         Err(e) => tx.send(Err(e)),
       };
@@ -51,11 +51,14 @@ impl ScopeManager {
     let mut scopes = self.scopes.lock().await;
     let scope = scopes
       .entry(name)
-      .or_insert_with(|| PackScope::new(name, self.options.clone(), self.strategy.clone()));
+      .or_insert_with(|| PackScope::new(self.strategy.get_path(name), self.options.clone()));
 
-    match scope.validate(&self.options).await {
+    match validate_scope(scope, self.strategy.as_ref()).await {
       Ok(validate) => match validate {
-        ValidateResult::Valid => scope.get_contents().await,
+        ValidateResult::Valid => {
+          self.strategy.ensure_contents(scope).await?;
+          scope.get_contents().await
+        }
         ValidateResult::Invalid(reason) => {
           scopes.clear();
           Err(error!("cache is not validate: {}", reason))
@@ -69,18 +72,34 @@ impl ScopeManager {
   }
 }
 
+async fn validate_scope(
+  scope: &mut PackScope,
+  strategy: &Box<dyn Strategy>,
+) -> Result<ValidateResult> {
+  strategy.ensure_meta(scope).await?;
+
+  let is_meta_valid = strategy.validate_meta(scope).await?;
+
+  if matches!(is_meta_valid, ValidateResult::Valid) {
+    strategy.ensure_keys(scope).await?;
+    strategy.validate_packs(scope).await
+  } else {
+    Ok(is_meta_valid)
+  }
+}
+
 async fn save_scopes(
   mut scopes: ScopeMap,
   mut updates: ScopeUpdates,
   options: Arc<PackOptions>,
-  strategy: Arc<dyn Strategy>,
+  strategy: &Box<dyn Strategy>,
 ) -> Result<ScopeMap> {
   strategy.before_save().await?;
 
   for (scope_name, _) in updates.iter() {
     scopes
       .entry(scope_name)
-      .or_insert_with(|| PackScope::empty(scope_name, options.clone(), strategy.clone()));
+      .or_insert_with(|| PackScope::empty(strategy.get_path(scope_name), options.clone()));
   }
 
   let update_tasks = join_all(
@@ -89,7 +108,7 @@ async fn save_scopes(
       .map(|(name, scope)| (scope, updates.remove(name).unwrap_or_default()))
       .collect_vec()
       .into_iter()
-      .map(|(scope, updates)| scope.update(updates)),
+      .map(|(scope, updates)| strategy.update_scope(scope, updates)),
   );
 
   update_tasks.await.into_iter().collect::<Result<()>>()?;
@@ -98,13 +117,13 @@ async fn save_scopes(
   let save_tasks = join_all(
     scopes
       .iter_mut()
-      .map(|(_, scope)| scope.save())
+      .map(|(_, scope)| async move { strategy.write_scope(scope).await })
       .collect_vec(),
   );
   let (writed_files, removed_files) = save_tasks
     .await
     .into_iter()
-    .collect::<Result<Vec<ScopeSaveResult>>>()?
+    .collect::<Result<Vec<WriteScopeResult>>>()?
     .into_iter()
     .fold((vec![], vec![]), |mut acc, s| {
       acc.0.extend(s.writed_files);

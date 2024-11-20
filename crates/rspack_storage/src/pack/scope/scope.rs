@@ -1,15 +1,11 @@
 use std::{path::PathBuf, sync::Arc};
 
 use itertools::Itertools;
-use rspack_error::{error, Result};
-use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use rspack_error::Result;
+use rustc_hash::FxHashSet as HashSet;
 
-use super::{
-  read_contents, read_keys, read_meta, read_packs, save_scope, update_scope, validate_meta,
-  validate_packs, ScopeSaveResult, ValidateResult,
-};
+use crate::pack::PackKeysState;
 use crate::pack::{Pack, PackContentsState, PackOptions, ScopeMeta};
-use crate::pack::{PackKeysState, Strategy};
 
 #[derive(Debug, Default, Clone)]
 pub enum ScopeMetaState {
@@ -76,33 +72,29 @@ pub struct PackScope {
   pub meta: ScopeMetaState,
   pub packs: ScopePacksState,
   pub removed: HashSet<PathBuf>,
-  pub strategy: Arc<dyn Strategy>,
 }
 
 impl PackScope {
-  pub fn new(name: &'static str, options: Arc<PackOptions>, strategy: Arc<dyn Strategy>) -> Self {
+  pub fn new(path: PathBuf, options: Arc<PackOptions>) -> Self {
     Self {
-      path: Arc::new(strategy.get_path(name)),
+      path: Arc::new(path),
       options,
       meta: ScopeMetaState::Pending,
       packs: ScopePacksState::Pending,
       removed: HashSet::default(),
-      strategy,
     }
   }
 
-  pub fn empty(name: &'static str, options: Arc<PackOptions>, strategy: Arc<dyn Strategy>) -> Self {
-    let scope_path = strategy.get_path(name);
-    let meta = ScopeMeta::new(&scope_path, &options);
+  pub fn empty(path: PathBuf, options: Arc<PackOptions>) -> Self {
+    let meta = ScopeMeta::new(&path, &options);
     let packs = vec![vec![]; options.buckets];
 
     Self {
-      path: Arc::new(scope_path),
+      path: Arc::new(path),
       options,
       meta: ScopeMetaState::Value(meta),
       packs: ScopePacksState::Value(packs),
       removed: HashSet::default(),
-      strategy,
     }
   }
 
@@ -117,9 +109,7 @@ impl PackScope {
         .all(|pack| pack.loaded())
   }
 
-  pub async fn get_contents(&mut self) -> Result<Vec<(Arc<Vec<u8>>, Arc<Vec<u8>>)>> {
-    self.ensure_pack_contents().await?;
-
+  pub async fn get_contents(&self) -> Result<Vec<(Arc<Vec<u8>>, Arc<Vec<u8>>)>> {
     Ok(
       self
         .packs
@@ -145,79 +135,5 @@ impl PackScope {
         .flatten()
         .collect_vec(),
     )
-  }
-
-  pub async fn validate(&mut self, options: &PackOptions) -> Result<ValidateResult> {
-    self.ensure_meta().await?;
-
-    let is_meta_valid = validate_meta(&self, &options).await?;
-
-    if matches!(is_meta_valid, ValidateResult::Valid) {
-      self.ensure_pack_keys().await?;
-      validate_packs(&self).await
-    } else {
-      Ok(is_meta_valid)
-    }
-  }
-
-  async fn ensure_meta(&mut self) -> Result<()> {
-    if matches!(self.meta, ScopeMetaState::Pending) {
-      self.meta = ScopeMetaState::Value(read_meta(&self).await?);
-    }
-    Ok(())
-  }
-
-  async fn ensure_packs(&mut self) -> Result<()> {
-    self.ensure_meta().await?;
-    if matches!(self.packs, ScopePacksState::Pending) {
-      self.packs = ScopePacksState::Value(read_packs(&self).await?);
-    }
-    Ok(())
-  }
-
-  async fn ensure_pack_keys(&mut self) -> Result<()> {
-    self.ensure_packs().await?;
-
-    let packs_results = read_keys(&self).await?;
-    let packs = self.packs.expect_value_mut();
-    for pack_res in packs_results {
-      if let Some(pack) = packs
-        .get_mut(pack_res.bucket_id)
-        .and_then(|packs| packs.get_mut(pack_res.pack_pos))
-      {
-        pack.keys = PackKeysState::Value(pack_res.keys);
-      }
-    }
-    Ok(())
-  }
-
-  async fn ensure_pack_contents(&mut self) -> Result<()> {
-    self.ensure_pack_keys().await?;
-
-    let packs_results = read_contents(&self).await?;
-    let packs = self.packs.expect_value_mut();
-    for pack_res in packs_results {
-      if let Some(pack) = packs
-        .get_mut(pack_res.bucket_id)
-        .and_then(|packs| packs.get_mut(pack_res.pack_pos))
-      {
-        pack.contents = PackContentsState::Value(pack_res.contents);
-      }
-    }
-    Ok(())
-  }
-
-  pub async fn update(&mut self, updates: HashMap<Vec<u8>, Option<Vec<u8>>>) -> Result<()> {
-    if !self.loaded() {
-      return Err(error!("scope not loaded, run `get_all` first"));
-    }
-    update_scope(self, updates).await
-  }
-
-  pub async fn save(&mut self) -> Result<ScopeSaveResult> {
-    if !self.loaded() {
-      return Err(error!("scope not loaded, run `get_all` first"));
-    }
-    save_scope(self).await
   }
 }
