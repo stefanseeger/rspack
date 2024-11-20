@@ -8,8 +8,7 @@ use rspack_error::{error, Result};
 use super::{util::get_pack_meta_pairs, SplitPackStrategy};
 use crate::pack::{
   Pack, PackContents, PackContentsState, PackFileMeta, PackFs, PackKeys, PackKeysState,
-  PackReadStrategy, PackScope, ScopeMeta, ScopeMetaState, ScopePacks, ScopePacksState,
-  ScopeReadStrategy,
+  PackReadStrategy, PackScope, ScopeMeta, ScopeMetaState, ScopePacksState, ScopeReadStrategy,
 };
 
 #[async_trait]
@@ -29,7 +28,22 @@ impl ScopeReadStrategy for SplitPackStrategy {
     self.ensure_meta(scope).await?;
 
     if matches!(scope.packs, ScopePacksState::Pending) {
-      scope.packs = ScopePacksState::Value(read_packs(&scope).await?);
+      scope.packs = ScopePacksState::Value(
+        scope
+          .meta
+          .expect_value()
+          .packs
+          .iter()
+          .enumerate()
+          .map(|(bucket_id, pack_meta_list)| {
+            let bucket_dir = scope.path.join(bucket_id.to_string());
+            pack_meta_list
+              .iter()
+              .map(|pack_meta| Pack::new(bucket_dir.join(&pack_meta.name)))
+              .collect_vec()
+          })
+          .collect_vec(),
+      );
     }
     Ok(())
   }
@@ -134,25 +148,6 @@ async fn read_scope_meta(path: &PathBuf, fs: Arc<dyn PackFs>) -> Result<Option<S
   }))
 }
 
-async fn read_packs(scope: &PackScope) -> Result<ScopePacks> {
-  Ok(
-    scope
-      .meta
-      .expect_value()
-      .packs
-      .iter()
-      .enumerate()
-      .map(|(bucket_id, pack_meta_list)| {
-        let bucket_dir = scope.path.join(bucket_id.to_string());
-        pack_meta_list
-          .iter()
-          .map(|pack_meta| Pack::new(bucket_dir.join(&pack_meta.name)))
-          .collect_vec()
-      })
-      .collect_vec(),
-  )
-}
-
 #[derive(Debug)]
 struct ReadKeysResult {
   pub bucket_id: usize,
@@ -161,49 +156,32 @@ struct ReadKeysResult {
 }
 
 async fn read_keys(scope: &PackScope, strategy: &SplitPackStrategy) -> Result<Vec<ReadKeysResult>> {
-  let candidates = get_pack_meta_pairs(scope)?
+  let (candidates_index_list, pack_list) = get_pack_meta_pairs(scope)?;
+  let tasks = pack_list
     .into_iter()
-    .filter(|(_, _, _, pack)| matches!(pack.keys, PackKeysState::Pending))
-    .map(|args| (args.0, args.1, args.3.path.to_owned()))
+    .map(|i| {
+      let strategy = strategy.to_owned();
+      let path = i.1.path.to_owned();
+      tokio::spawn(async move { strategy.read_pack_keys(&path).await }).map_err(|e| error!("{}", e))
+    })
     .collect_vec();
-  let readed = batch_read_keys(
-    candidates.iter().map(|i| i.2.to_owned()).collect_vec(),
-    strategy,
-  )
-  .await?;
+  let readed = join_all(tasks).await.into_iter().process_results(|iter| {
+    iter
+      .into_iter()
+      .process_results(|iter| iter.map(|x| x.unwrap_or_default()).collect_vec())
+  })??;
 
   Ok(
     readed
       .into_iter()
-      .zip(candidates.into_iter())
-      .map(|(keys, (bucket_id, pack_pos, _))| ReadKeysResult {
+      .zip(candidates_index_list.into_iter())
+      .map(|(keys, (bucket_id, pack_pos))| ReadKeysResult {
         bucket_id,
         pack_pos,
         keys,
       })
       .collect_vec(),
   )
-}
-
-async fn batch_read_keys(
-  candidates: Vec<PathBuf>,
-  strategy: &SplitPackStrategy,
-) -> Result<Vec<PackKeys>> {
-  let tasks = candidates.into_iter().map(|path| {
-    let strategy = strategy.to_owned();
-    tokio::spawn(async move { strategy.read_pack_keys(&path).await }).map_err(|e| error!("{}", e))
-  });
-
-  let readed = join_all(tasks)
-    .await
-    .into_iter()
-    .collect::<Result<Vec<Result<Option<PackKeys>>>>>()?;
-
-  let mut res = vec![];
-  for keys in readed {
-    res.push(keys?.unwrap_or_default());
-  }
-  Ok(res)
 }
 
 #[derive(Debug)]
@@ -217,51 +195,33 @@ async fn read_contents(
   scope: &PackScope,
   strategy: &SplitPackStrategy,
 ) -> Result<Vec<ReadContentsResult>> {
-  let candidates = get_pack_meta_pairs(scope)?
+  let (candidates_index_list, pack_list) = get_pack_meta_pairs(scope)?;
+  let tasks = pack_list
     .into_iter()
-    .filter(|(_, _, _, pack)| matches!(pack.contents, PackContentsState::Pending))
-    .map(|args| (args.0, args.1, args.3.path.to_owned()))
+    .map(|i| {
+      let strategy = strategy.to_owned();
+      let path = i.1.path.to_owned();
+      tokio::spawn(async move { strategy.read_pack_contents(&path).await })
+        .map_err(|e| error!("{}", e))
+    })
     .collect_vec();
-
-  let readed: Vec<Vec<Arc<Vec<u8>>>> = batch_read_contents(
-    candidates.iter().map(|i| i.2.to_owned()).collect_vec(),
-    strategy,
-  )
-  .await?;
+  let readed = join_all(tasks).await.into_iter().process_results(|iter| {
+    iter
+      .into_iter()
+      .process_results(|iter| iter.map(|x| x.unwrap_or_default()).collect_vec())
+  })??;
 
   Ok(
     readed
       .into_iter()
-      .zip(candidates.into_iter())
-      .map(|(contents, (bucket_id, pack_pos, _))| ReadContentsResult {
+      .zip(candidates_index_list.into_iter())
+      .map(|(contents, (bucket_id, pack_pos))| ReadContentsResult {
         bucket_id,
         pack_pos,
         contents,
       })
       .collect_vec(),
   )
-}
-
-async fn batch_read_contents(
-  candidates: Vec<PathBuf>,
-  strategy: &SplitPackStrategy,
-) -> Result<Vec<PackContents>> {
-  let tasks = candidates.into_iter().map(|path| {
-    let strategy = strategy.to_owned();
-    tokio::spawn(async move { strategy.read_pack_contents(&path).await })
-      .map_err(|e| error!("{}", e))
-  });
-
-  let readed = join_all(tasks)
-    .await
-    .into_iter()
-    .collect::<Result<Vec<Result<Option<PackContents>>>>>()?;
-
-  let mut res = vec![];
-  for contents in readed {
-    res.push(contents?.unwrap_or_default());
-  }
-  Ok(res)
 }
 
 #[cfg(test)]

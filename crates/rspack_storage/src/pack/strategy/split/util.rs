@@ -8,7 +8,7 @@ use crate::pack::{Pack, PackContents, PackFileMeta, PackKeys, PackScope};
 
 pub fn get_pack_meta_pairs(
   scope: &PackScope,
-) -> Result<Vec<(usize, usize, Arc<PackFileMeta>, &Pack)>> {
+) -> Result<(Vec<(usize, usize)>, Vec<(Arc<PackFileMeta>, &Pack)>)> {
   let meta = scope.meta.expect_value();
   let packs = scope.packs.expect_value();
 
@@ -24,16 +24,17 @@ pub fn get_pack_meta_pairs(
           .enumerate()
           .map(|(pack_pos, pack_meta)| {
             (
-              bucket_id,
-              pack_pos,
-              pack_meta.clone(),
-              bucket_packs.get(pack_pos).expect("should have bucket pack"),
+              (bucket_id, pack_pos),
+              (
+                pack_meta.clone(),
+                bucket_packs.get(pack_pos).expect("should have bucket pack"),
+              ),
             )
           })
           .collect_vec()
       })
       .flatten()
-      .collect_vec(),
+      .unzip(),
   )
 }
 

@@ -42,10 +42,12 @@ impl ScopeValidateStrategy for SplitPackStrategy {
   }
 
   async fn validate_packs(&self, scope: &mut PackScope) -> Result<ValidateResult> {
-    let candidates = get_pack_meta_pairs(scope)?
-      .iter()
-      .map(|(bucket_id, _, pack_meta, pack)| ValidatingPack {
-        path: scope.path.join(bucket_id.to_string()).join(&pack_meta.name),
+    let (_, pack_list) = get_pack_meta_pairs(scope)?;
+
+    let candidates = pack_list
+      .into_iter()
+      .map(|(pack_meta, pack)| ValidatingPack {
+        path: pack.path.to_owned(),
         hash: pack_meta.hash.to_owned(),
         keys: pack.keys.expect_value().to_owned(),
         contents: pack.keys.expect_value().to_owned(),
