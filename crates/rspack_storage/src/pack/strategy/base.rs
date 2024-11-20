@@ -16,9 +16,9 @@ use crate::{
 
 #[derive(Debug, Clone)]
 pub struct SplitPackStrategy {
-  fs: Arc<dyn PackFs>,
-  root: Arc<PathBuf>,
-  temp_root: Arc<PathBuf>,
+  pub fs: Arc<dyn PackFs>,
+  pub root: Arc<PathBuf>,
+  pub temp_root: Arc<PathBuf>,
 }
 
 impl SplitPackStrategy {
@@ -159,7 +159,7 @@ impl Strategy for SplitPackStrategy {
         .map(|packs| {
           packs
             .iter()
-            .map(|meta| format!("{},{}", meta.name, meta.hash))
+            .map(|meta| format!("{},{},{}", meta.name, meta.hash, meta.size))
             .join(" ")
         })
         .unwrap_or_default();
@@ -212,7 +212,7 @@ impl Strategy for SplitPackStrategy {
     let file_name = get_name(keys, contents);
     hasher.write(file_name.as_bytes());
 
-    let meta = self.fs.read_file_meta(path).await?;
+    let meta = self.fs.metadata(path).await?;
     hasher.write_u64(meta.size);
     hasher.write_u64(meta.mtime);
 
@@ -238,7 +238,7 @@ impl Strategy for SplitPackStrategy {
         PackFileMeta {
           name: file_name,
           hash: Default::default(),
-          size: 0,
+          size: new_pack.size(),
           writed: false,
         },
         new_pack,
@@ -249,9 +249,10 @@ impl Strategy for SplitPackStrategy {
       if items.len() == 0 {
         break;
       }
+      let last_item = items.last().expect("should have first item");
       // handle big single cache
-      if items.last().expect("should have first item").1.len() as f64
-        > options.max_pack_size as f64 * 0.5_f64
+      if last_item.0.len() as f64 + last_item.1.len() as f64
+        > options.max_pack_size as f64 * 0.8_f64
       {
         let (key, value) = items.pop().expect("shoud have first item");
         new_packs.push(create_pack(dir, vec![key], vec![value]));
@@ -259,6 +260,8 @@ impl Strategy for SplitPackStrategy {
         break;
       }
     }
+
+    items.reverse();
 
     loop {
       let mut batch_keys: PackKeys = vec![];
@@ -270,14 +273,14 @@ impl Strategy for SplitPackStrategy {
           break;
         }
 
-        if batch_size + items.last().expect("should have first item").1.len()
-          > options.max_pack_size
-        {
+        let last_item = items.last().expect("should have first item");
+
+        if batch_size + last_item.0.len() + last_item.1.len() > options.max_pack_size {
           break;
         }
 
         let (key, value) = items.pop().expect("shoud have first item");
-        batch_size += value.len();
+        batch_size += value.len() + key.len();
         batch_keys.push(key);
         batch_contents.push(value);
       }
@@ -291,7 +294,6 @@ impl Strategy for SplitPackStrategy {
       }
     }
 
-    println!("new packs: {:?}", new_packs.len());
     new_packs
   }
 
@@ -332,23 +334,14 @@ impl Strategy for SplitPackStrategy {
 
     for (dirty_key, dirty_value) in updates.iter() {
       if dirty_value.is_some() {
+        insert_keys.insert(dirty_key.clone());
         if let Some(pack_meta) = update_to_meta.get(dirty_key) {
-          // update
-          // updated_packs.insert(pack_meta);
-          // updated_keys.insert(dirty_key)
-          insert_keys.insert(dirty_key.clone());
           removed_packs.insert(pack_meta.clone());
-        } else {
-          // insert
-          insert_keys.insert(dirty_key.clone());
         }
       } else {
+        removed_keys.insert(dirty_key.clone());
         if let Some(pack_meta) = update_to_meta.get(dirty_key) {
-          // remove
-          removed_keys.insert(dirty_key.clone());
           removed_packs.insert(pack_meta.clone());
-        } else {
-          // not exists, do nothing
         }
       }
     }
@@ -453,6 +446,8 @@ impl Strategy for SplitPackStrategy {
     for content in contents {
       writer.bytes(content).await?;
     }
+
+    writer.flush().await?;
 
     Ok(())
   }

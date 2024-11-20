@@ -150,11 +150,11 @@ impl PackScope {
   pub async fn validate(&mut self, options: &PackOptions) -> Result<ValidateResult> {
     self.ensure_meta().await?;
 
-    let is_meta_valid = validate_meta(&self, &options)?;
+    let is_meta_valid = validate_meta(&self, &options).await?;
 
     if matches!(is_meta_valid, ValidateResult::Valid) {
       self.ensure_pack_keys().await?;
-      validate_packs(&self)
+      validate_packs(&self).await
     } else {
       Ok(is_meta_valid)
     }
@@ -170,7 +170,7 @@ impl PackScope {
   async fn ensure_packs(&mut self) -> Result<()> {
     self.ensure_meta().await?;
     if matches!(self.packs, ScopePacksState::Pending) {
-      self.packs = ScopePacksState::Value(read_packs(&self)?);
+      self.packs = ScopePacksState::Value(read_packs(&self).await?);
     }
     Ok(())
   }
@@ -178,7 +178,7 @@ impl PackScope {
   async fn ensure_pack_keys(&mut self) -> Result<()> {
     self.ensure_packs().await?;
 
-    let packs_results = read_keys(&self)?;
+    let packs_results = read_keys(&self).await?;
     let packs = self.packs.expect_value_mut();
     for pack_res in packs_results {
       if let Some(pack) = packs
@@ -194,7 +194,7 @@ impl PackScope {
   async fn ensure_pack_contents(&mut self) -> Result<()> {
     self.ensure_pack_keys().await?;
 
-    let packs_results = read_contents(&self)?;
+    let packs_results = read_contents(&self).await?;
     let packs = self.packs.expect_value_mut();
     for pack_res in packs_results {
       if let Some(pack) = packs

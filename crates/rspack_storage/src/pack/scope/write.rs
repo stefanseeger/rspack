@@ -1,12 +1,11 @@
 use std::path::PathBuf;
-use std::{hash::Hasher, sync::Arc};
+use std::sync::Arc;
 
 use futures::future::join_all;
 use futures::TryFutureExt;
 use itertools::Itertools;
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use rspack_error::{error, Result};
-use rustc_hash::FxHasher;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::{PackFileMeta, PackScope, ScopeMetaState, ScopePacksState};
@@ -99,7 +98,6 @@ pub async fn update_scope(
     }
 
     for (pack_meta, pack) in bucket_result.new_packs {
-      total_files.insert(pack.path.clone());
       scope_packs[bucket_id].push(pack);
       scope_meta.packs[bucket_id].push(Arc::new(pack_meta));
     }
@@ -108,10 +106,7 @@ pub async fn update_scope(
   }
 
   // should not remove pack files
-  scope.removed = std::mem::take(&mut scope.removed)
-    .into_iter()
-    .filter(|r| total_files.contains(r))
-    .collect();
+  scope.removed.retain(|r| !total_files.contains(r));
 
   scope.packs = ScopePacksState::Value(scope_packs);
   scope.meta = ScopeMetaState::Value(scope_meta);
@@ -120,12 +115,11 @@ pub async fn update_scope(
 }
 
 fn choose_bucket(key: &Vec<u8>, total: usize) -> usize {
-  let mut hasher = FxHasher::default();
-  hasher.write(key);
-  let bucket_id = usize::try_from(hasher.finish() % total as u64).expect("should get bucket id");
-  bucket_id
+  let num = key.iter().fold(0_usize, |acc, i| acc + *i as usize);
+  num % total
 }
 
+#[derive(Debug)]
 pub struct ScopeSaveResult {
   pub writed_files: HashSet<PathBuf>,
   pub removed_files: HashSet<PathBuf>,
@@ -206,4 +200,317 @@ async fn batch_write_packs(
     res.push(item?);
   }
   Ok(res)
+}
+
+#[cfg(test)]
+mod tests {
+
+  use std::{collections::HashMap, path::PathBuf, sync::Arc};
+
+  use itertools::Itertools;
+  use rspack_error::Result;
+
+  use super::{save_scope, update_scope};
+  use crate::{
+    pack::{PackFs, PackMemoryFs, PackScope, SplitPackStrategy, Strategy},
+    PackOptions,
+  };
+
+  fn get_total_pack_count(scope: &PackScope) -> usize {
+    scope.packs.expect_value().iter().flatten().count()
+  }
+  fn get_bucket_pack_count(scope: &PackScope) -> Vec<usize> {
+    scope
+      .packs
+      .expect_value()
+      .iter()
+      .map(|i| i.len())
+      .collect_vec()
+  }
+  fn get_bucket_size(scope: &PackScope) -> Vec<usize> {
+    let mut res = scope
+      .meta
+      .expect_value()
+      .packs
+      .iter()
+      .flatten()
+      .map(|c| c.size)
+      .collect_vec();
+    res.sort_unstable();
+    res
+  }
+
+  async fn test_short_value(scope: &mut PackScope, pre: usize, size: usize) -> Result<()> {
+    let mut updates = HashMap::default();
+
+    for i in pre..pre + size {
+      let key = format!("{:0>4}_key", i);
+      let val = format!("{:0>4}_val", i);
+      updates.insert(key.as_bytes().to_vec(), Some(val.as_bytes().to_vec()));
+    }
+    update_scope(scope, updates).await?;
+
+    let contents = scope
+      .get_contents()
+      .await?
+      .into_iter()
+      .collect::<HashMap<_, _>>();
+
+    assert_eq!(contents.len(), pre + size);
+    assert_eq!(
+      **contents
+        .get(&format!("{:0>4}_key", pre).as_bytes().to_vec())
+        .expect("should have key"),
+      format!("{:0>4}_val", pre).as_bytes().to_vec()
+    );
+    assert_eq!(
+      **contents
+        .get(&format!("{:0>4}_key", pre + size - 1).as_bytes().to_vec())
+        .expect("should have key"),
+      format!("{:0>4}_val", pre + size - 1).as_bytes().to_vec()
+    );
+
+    Ok(())
+  }
+
+  async fn test_long_value(scope: &mut PackScope, size: usize) -> Result<()> {
+    let mut updates = HashMap::default();
+
+    for i in 0..size {
+      let key = format!("{:0>20}_key", i);
+      let val = format!("{:0>20}_val", i);
+      updates.insert(key.as_bytes().to_vec(), Some(val.as_bytes().to_vec()));
+    }
+
+    let pre_item_count = scope.get_contents().await?.len();
+    update_scope(scope, updates).await?;
+    let contents = scope
+      .get_contents()
+      .await?
+      .into_iter()
+      .collect::<HashMap<_, _>>();
+
+    assert_eq!(contents.len(), pre_item_count + size);
+    assert_eq!(
+      **contents
+        .get(&format!("{:0>20}_key", 0).as_bytes().to_vec())
+        .expect("should have key"),
+      format!("{:0>20}_val", 0).as_bytes().to_vec()
+    );
+    assert_eq!(
+      **contents
+        .get(&format!("{:0>20}_key", size - 1).as_bytes().to_vec())
+        .expect("should have key"),
+      format!("{:0>20}_val", size - 1).as_bytes().to_vec()
+    );
+    Ok(())
+  }
+
+  async fn test_update_value(scope: &mut PackScope) -> Result<()> {
+    let mut updates = HashMap::default();
+    let key = format!("{:0>4}_key", 0);
+    let val = format!("{:0>4}_new", 0);
+    updates.insert(key.as_bytes().to_vec(), Some(val.as_bytes().to_vec()));
+
+    let pre_item_count = scope.get_contents().await?.len();
+    update_scope(scope, updates).await?;
+    let contents = scope
+      .get_contents()
+      .await?
+      .into_iter()
+      .collect::<HashMap<_, _>>();
+
+    assert_eq!(contents.len(), pre_item_count);
+
+    assert_eq!(
+      **contents
+        .get(&format!("{:0>4}_key", 0).as_bytes().to_vec())
+        .expect("should have key"),
+      format!("{:0>4}_new", 0).as_bytes().to_vec()
+    );
+
+    Ok(())
+  }
+
+  async fn test_remove_value(scope: &mut PackScope) -> Result<()> {
+    let mut updates = HashMap::default();
+    let key = format!("{:0>4}_key", 1);
+    updates.insert(key.as_bytes().to_vec(), None);
+    let pre_item_count = scope.get_contents().await?.len();
+    update_scope(scope, updates).await?;
+    let contents = scope
+      .get_contents()
+      .await?
+      .into_iter()
+      .collect::<HashMap<_, _>>();
+
+    assert_eq!(contents.len(), pre_item_count - 1);
+    assert!(contents
+      .get(&format!("{:0>4}_key", 1).as_bytes().to_vec())
+      .is_none());
+    Ok(())
+  }
+
+  async fn test_single_bucket(scope: &mut PackScope) -> Result<()> {
+    test_short_value(scope, 0, 10).await?;
+    assert_eq!(get_total_pack_count(&scope), 5);
+    let res = save_scope(scope).await?;
+    // 5 packs + 1 meta
+    assert_eq!(res.writed_files.len(), 6);
+    assert_eq!(res.removed_files.len(), 0);
+
+    test_long_value(scope, 5).await?;
+    assert_eq!(get_total_pack_count(&scope), 10);
+    let res = save_scope(scope).await?;
+    // 5 packs + 1 meta
+    assert_eq!(res.writed_files.len(), 6);
+    assert_eq!(res.removed_files.len(), 0);
+
+    test_update_value(scope).await?;
+    assert_eq!(get_total_pack_count(&scope), 10);
+    let res = save_scope(scope).await?;
+    // 1 packs + 1 meta
+    assert_eq!(res.writed_files.len(), 2);
+    assert_eq!(res.removed_files.len(), 1);
+
+    test_remove_value(scope).await?;
+    assert_eq!(get_total_pack_count(&scope), 10);
+    let res = save_scope(scope).await?;
+    // 1 packs + 1 meta
+    assert_eq!(res.writed_files.len(), 2);
+    assert_eq!(res.removed_files.len(), 1);
+
+    Ok(())
+  }
+
+  async fn test_multi_bucket(scope: &mut PackScope) -> Result<()> {
+    test_short_value(scope, 0, 100).await?;
+    assert_eq!(get_bucket_pack_count(&scope), vec![5; 10]);
+
+    let res = save_scope(scope).await?;
+    // 50 packs + 1 meta
+    assert_eq!(res.writed_files.len(), 51);
+    assert_eq!(res.removed_files.len(), 0);
+
+    test_long_value(scope, 50).await?;
+    assert_eq!(get_bucket_pack_count(&scope), vec![10; 10]);
+    let res = save_scope(scope).await?;
+    // 50 packs + 1 meta
+    assert_eq!(res.writed_files.len(), 51);
+    assert_eq!(res.removed_files.len(), 0);
+
+    test_update_value(scope).await?;
+    assert_eq!(get_bucket_pack_count(&scope), vec![10; 10]);
+    let res = save_scope(scope).await?;
+    // 1 packs + 1 meta
+    assert_eq!(res.writed_files.len(), 2);
+    assert_eq!(res.removed_files.len(), 1);
+
+    test_remove_value(scope).await?;
+    assert_eq!(get_bucket_pack_count(&scope), vec![10; 10]);
+    let res = save_scope(scope).await?;
+    // 1 packs + 1 meta
+    assert_eq!(res.writed_files.len(), 2);
+    assert_eq!(res.removed_files.len(), 1);
+
+    Ok(())
+  }
+
+  async fn test_big_bucket(scope: &mut PackScope) -> Result<()> {
+    // 200 * 16 = 3200 = 2000 + 1200
+    test_short_value(scope, 0, 200).await?;
+    assert_eq!(get_total_pack_count(&scope), 2);
+    assert_eq!(get_bucket_size(&scope), [1200, 2000]);
+
+    // 3200 + 100 * 16 = 4800 = 2000 + 2000 + 800
+    test_short_value(scope, 200, 100).await?;
+    assert_eq!(get_total_pack_count(&scope), 3);
+    assert_eq!(get_bucket_size(&scope), [800, 2000, 2000]);
+
+    // 4800 + 60 * 16 = 5760 = 2000 + 2000 + 1760(>1600)
+    test_short_value(scope, 300, 60).await?;
+    assert_eq!(get_total_pack_count(&scope), 3);
+    assert_eq!(get_bucket_size(&scope), [1760, 2000, 2000]);
+
+    // 5760 + 160 = 5920 = 2000 + 2000 + 1760(>1600) + 160
+    test_short_value(scope, 360, 10).await?;
+    assert_eq!(get_total_pack_count(&scope), 4);
+    assert_eq!(get_bucket_size(&scope), [160, 1760, 2000, 2000]);
+
+    Ok(())
+  }
+
+  async fn clean_scope_path(scope: &PackScope, strategy: Arc<dyn Strategy>, fs: Arc<dyn PackFs>) {
+    fs.remove_dir(&scope.path).await.expect("should remove dir");
+    fs.remove_dir(
+      &strategy
+        .get_temp_path(&scope.path)
+        .expect("should get temp path"),
+    )
+    .await
+    .expect("should remove dir");
+  }
+
+  #[tokio::test]
+  async fn should_single_bucket_work() {
+    let fs = Arc::new(PackMemoryFs::default());
+    let strategy = Arc::new(SplitPackStrategy::new(
+      PathBuf::from("/cache"),
+      PathBuf::from("/temp"),
+      fs.clone(),
+    ));
+    let options = Arc::new(PackOptions {
+      buckets: 1,
+      max_pack_size: 32,
+      expires: 1000000,
+    });
+    let mut scope = PackScope::empty("test_single_bucket", options.clone(), strategy.clone());
+    clean_scope_path(&scope, strategy.clone(), fs.clone()).await;
+
+    let _ = test_single_bucket(&mut scope).await.map_err(|e| {
+      panic!("{}", e);
+    });
+  }
+
+  #[tokio::test]
+  async fn should_multi_bucket_work() {
+    let fs = Arc::new(PackMemoryFs::default());
+    let strategy = Arc::new(SplitPackStrategy::new(
+      PathBuf::from("/cache"),
+      PathBuf::from("/temp"),
+      fs.clone(),
+    ));
+    let options = Arc::new(PackOptions {
+      buckets: 10,
+      max_pack_size: 32,
+      expires: 1000000,
+    });
+    let mut scope = PackScope::empty("test_multi_bucket", options.clone(), strategy.clone());
+    clean_scope_path(&scope, strategy.clone(), fs.clone()).await;
+
+    let _ = test_multi_bucket(&mut scope).await.map_err(|e| {
+      panic!("{}", e);
+    });
+  }
+
+  #[tokio::test]
+  async fn should_big_bucket_work() {
+    let fs = Arc::new(PackMemoryFs::default());
+    let strategy = Arc::new(SplitPackStrategy::new(
+      PathBuf::from("/cache"),
+      PathBuf::from("/temp"),
+      fs.clone(),
+    ));
+    let options = Arc::new(PackOptions {
+      buckets: 1,
+      max_pack_size: 2000,
+      expires: 1000000,
+    });
+    let mut scope = PackScope::empty("test_big_bucket", options.clone(), strategy.clone());
+    clean_scope_path(&scope, strategy.clone(), fs.clone()).await;
+
+    let _ = test_big_bucket(&mut scope).await.map_err(|e| {
+      panic!("{}", e);
+    });
+  }
 }

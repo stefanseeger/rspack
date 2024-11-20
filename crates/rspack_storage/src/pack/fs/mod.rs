@@ -14,6 +14,8 @@ pub use error::*;
 pub struct FileMeta {
   pub size: u64,
   pub mtime: u64,
+  pub is_file: bool,
+  pub is_dir: bool,
 }
 
 #[async_trait::async_trait]
@@ -37,7 +39,7 @@ pub trait PackFs: std::fmt::Debug + Sync + Send {
   async fn ensure_dir(&self, path: &PathBuf) -> Result<()>;
   async fn write_file(&self, path: &PathBuf) -> Result<Box<dyn PackFileWriter>>;
   async fn read_file(&self, path: &PathBuf) -> Result<Box<dyn PackFileReader>>;
-  async fn read_file_meta(&self, path: &PathBuf) -> Result<FileMeta>;
+  async fn metadata(&self, path: &PathBuf) -> Result<FileMeta>;
   async fn remove_file(&self, path: &PathBuf) -> Result<()>;
   async fn move_file(&self, from: &PathBuf, to: &PathBuf) -> Result<()>;
 }

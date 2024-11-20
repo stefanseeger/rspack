@@ -29,18 +29,25 @@ impl std::fmt::Display for PackFsErrorOpt {
 }
 
 #[derive(Debug, Error)]
-#[error("{opt} {file} failed: {inner}")]
+#[error(r#"Rspack Storage FS Error: {opt} `{file}` failed with `{inner}`"#)]
 pub struct PackFsError {
   file: String,
-  inner: std::io::Error,
+  inner: String,
   opt: PackFsErrorOpt,
 }
 
 impl PackFsError {
-  pub fn new(file: &PathBuf, opt: PackFsErrorOpt, error: std::io::Error) -> Self {
+  pub fn from_io_error(file: &PathBuf, opt: PackFsErrorOpt, error: std::io::Error) -> Self {
     Self {
       file: file.to_string_lossy().to_string(),
-      inner: error,
+      inner: error.to_string(),
+      opt,
+    }
+  }
+  pub fn from_fs_error(file: &PathBuf, opt: PackFsErrorOpt, error: rspack_fs::Error) -> Self {
+    Self {
+      file: file.to_string_lossy().to_string(),
+      inner: error.to_string(),
       opt,
     }
   }

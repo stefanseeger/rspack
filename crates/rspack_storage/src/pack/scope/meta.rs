@@ -31,7 +31,7 @@ impl ScopeMeta {
       last_modified: SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("should get current time")
-        .as_secs(),
+        .as_millis() as u64,
       packs: vec![vec![]; options.buckets],
     }
   }

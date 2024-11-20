@@ -6,9 +6,7 @@ use std::{
 
 use futures::{future::join_all, TryFutureExt};
 use itertools::Itertools;
-use pollster::block_on;
 use rspack_error::{error, Result};
-use tokio::task::unconstrained;
 
 use super::{get_pack_meta_pairs, PackScope};
 use crate::{
@@ -30,7 +28,7 @@ pub struct ValidatingPack {
   pub contents: PackContents,
 }
 
-pub fn validate_meta(scope: &PackScope, options: &PackOptions) -> Result<ValidateResult> {
+pub async fn validate_meta(scope: &PackScope, options: &PackOptions) -> Result<ValidateResult> {
   let meta = scope.meta.expect_value();
   if meta.buckets != options.buckets || meta.max_pack_size != options.max_pack_size {
     return Ok(ValidateResult::Invalid("scope options changed".to_string()));
@@ -48,7 +46,7 @@ pub fn validate_meta(scope: &PackScope, options: &PackOptions) -> Result<Validat
   return Ok(ValidateResult::Valid);
 }
 
-pub fn validate_packs(scope: &PackScope) -> Result<ValidateResult> {
+pub async fn validate_packs(scope: &PackScope) -> Result<ValidateResult> {
   let candidates = get_pack_meta_pairs(scope)?
     .iter()
     .map(|(bucket_id, _, pack_meta, pack)| ValidatingPack {
@@ -58,10 +56,7 @@ pub fn validate_packs(scope: &PackScope) -> Result<ValidateResult> {
       contents: pack.keys.expect_value().to_owned(),
     })
     .collect_vec();
-  let validate_results = block_on(unconstrained(batch_validate_packs(
-    candidates,
-    scope.strategy.clone(),
-  )))?;
+  let validate_results = batch_validate_packs(candidates, scope.strategy.clone()).await?;
   if validate_results.into_iter().all(|v| v) {
     Ok(ValidateResult::Valid)
   } else {
