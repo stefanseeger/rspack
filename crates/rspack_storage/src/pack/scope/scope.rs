@@ -1,7 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
 use itertools::Itertools;
-use rspack_error::Result;
 use rustc_hash::FxHashSet as HashSet;
 
 use crate::pack::PackKeysState;
@@ -109,31 +108,29 @@ impl PackScope {
         .all(|pack| pack.loaded())
   }
 
-  pub async fn get_contents(&self) -> Result<Vec<(Arc<Vec<u8>>, Arc<Vec<u8>>)>> {
-    Ok(
-      self
-        .packs
-        .expect_value()
-        .iter()
-        .flatten()
-        .filter_map(|pack| {
-          if let (PackKeysState::Value(keys), PackContentsState::Value(contents)) =
-            (&pack.keys, &pack.contents)
-          {
-            if keys.len() == contents.len() {
-              return Some(
-                keys
-                  .iter()
-                  .enumerate()
-                  .map(|(index, key)| (key.clone(), contents[index].clone()))
-                  .collect_vec(),
-              );
-            }
+  pub fn get_contents(&self) -> Vec<(Arc<Vec<u8>>, Arc<Vec<u8>>)> {
+    self
+      .packs
+      .expect_value()
+      .iter()
+      .flatten()
+      .filter_map(|pack| {
+        if let (PackKeysState::Value(keys), PackContentsState::Value(contents)) =
+          (&pack.keys, &pack.contents)
+        {
+          if keys.len() == contents.len() {
+            return Some(
+              keys
+                .iter()
+                .enumerate()
+                .map(|(index, key)| (key.clone(), contents[index].clone()))
+                .collect_vec(),
+            );
           }
-          None
-        })
-        .flatten()
-        .collect_vec(),
-    )
+        }
+        None
+      })
+      .flatten()
+      .collect_vec()
   }
 }

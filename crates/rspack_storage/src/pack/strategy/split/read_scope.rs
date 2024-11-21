@@ -5,7 +5,7 @@ use futures::{future::join_all, TryFutureExt};
 use itertools::Itertools;
 use rspack_error::{error, Result};
 
-use super::{util::get_pack_meta_pairs, SplitPackStrategy};
+use super::{util::get_indexed_packs, SplitPackStrategy};
 use crate::pack::{
   Pack, PackContents, PackContentsState, PackFileMeta, PackFs, PackKeys, PackKeysState,
   PackReadStrategy, PackScope, ScopeMeta, ScopeMetaState, ScopePacksState, ScopeReadStrategy,
@@ -156,7 +156,7 @@ struct ReadKeysResult {
 }
 
 async fn read_keys(scope: &PackScope, strategy: &SplitPackStrategy) -> Result<Vec<ReadKeysResult>> {
-  let (candidates_index_list, pack_list) = get_pack_meta_pairs(scope)?;
+  let (candidates_index_list, pack_list) = get_indexed_packs(scope)?;
   let tasks = pack_list
     .into_iter()
     .map(|i| {
@@ -195,7 +195,7 @@ async fn read_contents(
   scope: &PackScope,
   strategy: &SplitPackStrategy,
 ) -> Result<Vec<ReadContentsResult>> {
-  let (candidates_index_list, pack_list) = get_pack_meta_pairs(scope)?;
+  let (candidates_index_list, pack_list) = get_indexed_packs(scope)?;
   let tasks = pack_list
     .into_iter()
     .map(|i| {
@@ -227,88 +227,31 @@ async fn read_contents(
 #[cfg(test)]
 mod tests {
 
-  use std::{
-    collections::HashSet,
-    path::PathBuf,
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-  };
+  use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
   use itertools::Itertools;
   use rspack_error::Result;
 
   use crate::{
     pack::{
+      strategy::split::test::test_pack_utils::{mock_meta_file, mock_pack_file},
       PackFileMeta, PackFs, PackMemoryFs, PackScope, ScopeMeta, ScopeReadStrategy,
       SplitPackStrategy,
     },
     PackOptions,
   };
 
-  async fn mock_packs(path: &PathBuf, fs: Arc<dyn PackFs>, options: &PackOptions) -> Result<()> {
+  async fn mock_scope(path: &PathBuf, fs: Arc<dyn PackFs>, options: &PackOptions) -> Result<()> {
+    mock_meta_file(&ScopeMeta::get_path(path), fs.clone(), options, 3).await?;
     for bucket_id in 0..options.buckets {
       for pack_no in 0..3 {
+        let unique_id = format!("{}_{}", bucket_id, pack_no);
         let pack_name = format!("pack_name_{}_{}", bucket_id, pack_no);
-        fs.ensure_dir(&path.join(bucket_id.to_string())).await?;
-        let mut writer = fs
-          .write_file(&path.join(format!("./{}/{}", bucket_id, pack_name)))
-          .await?;
-        let mut keys = vec![];
-        let mut contents = vec![];
-        for i in 0..10 {
-          keys.push(
-            format!("key_{}_{}_{}", bucket_id, pack_no, i)
-              .as_bytes()
-              .to_vec(),
-          );
-          contents.push(
-            format!("val_{}_{}_{}", bucket_id, pack_no, i)
-              .as_bytes()
-              .to_vec(),
-          );
-        }
-        writer
-          .line(keys.iter().map(|k| k.len()).join(" ").as_str())
-          .await?;
-        writer
-          .line(contents.iter().map(|k| k.len()).join(" ").as_str())
-          .await?;
-        for key in keys {
-          writer.bytes(&key).await?;
-        }
-        for content in contents {
-          writer.bytes(&content).await?;
-        }
-        writer.flush().await?;
+        let pack_path = path.join(format!("./{}/{}", bucket_id, pack_name));
+        mock_pack_file(&pack_path, &unique_id, 10, fs.clone()).await?;
       }
     }
 
-    Ok(())
-  }
-
-  async fn mock_meta(path: &PathBuf, fs: Arc<dyn PackFs>, options: &PackOptions) -> Result<()> {
-    fs.ensure_dir(&PathBuf::from(path.parent().expect("should have parent")))
-      .await?;
-    let mut writer = fs.write_file(path).await?;
-    let current = SystemTime::now()
-      .duration_since(UNIX_EPOCH)
-      .expect("should get current time")
-      .as_millis() as u64;
-    writer
-      .line(format!("{} {} {}", options.buckets, options.max_pack_size, current).as_str())
-      .await?;
-    for bucket_id in 0..options.buckets {
-      let mut pack_meta_list = vec![];
-      for pack_no in 0..3 {
-        let pack_name = format!("pack_name_{}_{}", bucket_id, pack_no);
-        let pack_hash = format!("pack_hash_{}_{}", bucket_id, pack_no);
-        let pack_size = 100;
-        pack_meta_list.push(format!("{},{},{}", pack_name, pack_hash, pack_size));
-      }
-      writer.line(pack_meta_list.join(" ").as_str()).await?;
-    }
-
-    writer.flush().await?;
     Ok(())
   }
 
@@ -411,15 +354,7 @@ mod tests {
     let mut scope = PackScope::new(PathBuf::from("/cache/test_read_meta"), options.clone());
     clean_scope_path(&scope, &strategy, fs.clone()).await;
 
-    mock_meta(
-      &ScopeMeta::get_path(scope.path.as_ref()),
-      fs.clone(),
-      &scope.options,
-    )
-    .await
-    .expect("should mock meta");
-
-    mock_packs(&scope.path, fs.clone(), &scope.options)
+    mock_scope(&scope.path, fs.clone(), &scope.options)
       .await
       .expect("should mock packs");
 

@@ -9,7 +9,7 @@ use crate::{
   PackOptions,
 };
 
-pub struct PackIncrementalResult {
+pub struct UpdatePacksResult {
   pub new_packs: Vec<(PackFileMeta, Pack)>,
   pub remain_packs: Vec<(Arc<PackFileMeta>, Pack)>,
   pub removed_files: Vec<PathBuf>,
@@ -26,32 +26,20 @@ pub trait PackStrategy: PackReadStrategy + PackWriteStrategy + ScopeValidateStra
 
 #[async_trait]
 pub trait PackReadStrategy {
-  async fn get_pack_hash(
-    &self,
-    path: &PathBuf,
-    keys: &PackKeys,
-    contents: &PackContents,
-  ) -> Result<String>;
-
   async fn read_pack_keys(&self, path: &PathBuf) -> Result<Option<PackKeys>>;
   async fn read_pack_contents(&self, path: &PathBuf) -> Result<Option<PackContents>>;
 }
 
 #[async_trait]
 pub trait PackWriteStrategy {
-  async fn update_pack(
+  async fn update_packs(
     &self,
     dir: PathBuf,
     options: &PackOptions,
     packs: HashMap<Arc<PackFileMeta>, Pack>,
     updates: HashMap<Arc<Vec<u8>>, Option<Arc<Vec<u8>>>>,
-  ) -> PackIncrementalResult;
-  async fn write_pack(
-    &self,
-    path: &PathBuf,
-    keys: &PackKeys,
-    contents: &PackContents,
-  ) -> Result<()>;
+  ) -> UpdatePacksResult;
+  async fn write_pack(&self, pack: &Pack) -> Result<()>;
 }
 
 // #[async_trait]

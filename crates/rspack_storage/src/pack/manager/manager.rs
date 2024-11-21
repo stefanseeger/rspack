@@ -57,7 +57,7 @@ impl ScopeManager {
       Ok(validate) => match validate {
         ValidateResult::Valid => {
           self.strategy.ensure_contents(scope).await?;
-          scope.get_contents().await
+          Ok(scope.get_contents())
         }
         ValidateResult::Invalid(reason) => {
           scopes.clear();

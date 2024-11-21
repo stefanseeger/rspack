@@ -1,9 +1,11 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{hash::Hasher, path::PathBuf, sync::Arc};
 
 use futures::{future::join_all, TryFutureExt};
 use rspack_error::{error, Result};
+use rustc_hash::FxHasher;
 
-use crate::pack::{PackFs, PackStrategy, ScopeStrategy, Strategy};
+use super::util::get_name;
+use crate::pack::{PackContents, PackFs, PackKeys, PackStrategy, ScopeStrategy, Strategy};
 
 #[derive(Debug, Clone)]
 pub struct SplitPackStrategy {
@@ -60,6 +62,23 @@ impl SplitPackStrategy {
       .strip_prefix(&*self.root)
       .map_err(|e| error!("failed to get relative path: {}", e))?;
     Ok(self.temp_root.join(relative_path))
+  }
+
+  pub async fn get_pack_hash(
+    &self,
+    path: &PathBuf,
+    keys: &PackKeys,
+    contents: &PackContents,
+  ) -> Result<String> {
+    let mut hasher = FxHasher::default();
+    let file_name = get_name(keys, contents);
+    hasher.write(file_name.as_bytes());
+
+    let meta = self.fs.metadata(path).await?;
+    hasher.write_u64(meta.size);
+    hasher.write_u64(meta.mtime);
+
+    Ok(format!("{:016x}", hasher.finish()))
   }
 }
 

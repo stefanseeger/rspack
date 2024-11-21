@@ -6,7 +6,7 @@ use rustc_hash::FxHasher;
 
 use crate::pack::{Pack, PackContents, PackFileMeta, PackKeys, PackScope};
 
-pub fn get_pack_meta_pairs(
+pub fn get_indexed_packs(
   scope: &PackScope,
 ) -> Result<(Vec<(usize, usize)>, Vec<(Arc<PackFileMeta>, &Pack)>)> {
   let meta = scope.meta.expect_value();

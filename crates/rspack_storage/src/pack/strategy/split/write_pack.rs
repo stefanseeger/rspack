@@ -1,27 +1,27 @@
 use std::{path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use rspack_error::Result;
+use rspack_error::{error, Result};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::SplitPackStrategy;
 use crate::{
   pack::{
-    strategy::split::util::get_name, Pack, PackContents, PackContentsState, PackFileMeta,
-    PackIncrementalResult, PackKeys, PackKeysState, PackWriteStrategy,
+    strategy::split::util::get_name, Pack, PackContents, PackContentsState, PackFileMeta, PackKeys,
+    PackKeysState, PackWriteStrategy, UpdatePacksResult,
   },
   PackOptions,
 };
 
 #[async_trait]
 impl PackWriteStrategy for SplitPackStrategy {
-  async fn update_pack(
+  async fn update_packs(
     &self,
     dir: PathBuf,
     options: &PackOptions,
     mut packs: HashMap<Arc<PackFileMeta>, Pack>,
     mut updates: HashMap<Arc<Vec<u8>>, Option<Arc<Vec<u8>>>>,
-  ) -> PackIncrementalResult {
+  ) -> UpdatePacksResult {
     let update_to_meta = packs
       .iter()
       .fold(HashMap::default(), |mut acc, (pack_meta, pack)| {
@@ -117,20 +117,20 @@ impl PackWriteStrategy for SplitPackStrategy {
 
     let new_packs: Vec<(PackFileMeta, Pack)> = create(&dir, options, &mut wait_items).await;
 
-    PackIncrementalResult {
+    UpdatePacksResult {
       new_packs,
       remain_packs,
       removed_files,
     }
   }
 
-  async fn write_pack(
-    &self,
-    path: &PathBuf,
-    keys: &PackKeys,
-    contents: &PackContents,
-  ) -> Result<()> {
-    let path = self.get_temp_path(path)?;
+  async fn write_pack(&self, pack: &Pack) -> Result<()> {
+    let path = self.get_temp_path(&pack.path)?;
+    let keys = pack.keys.expect_value();
+    let contents = pack.contents.expect_value();
+    if keys.len() != contents.len() {
+      return Err(error!("pack keys and contents length not match"));
+    }
     self
       .fs
       .ensure_dir(&PathBuf::from(path.parent().expect("should have parent")))
@@ -250,4 +250,229 @@ async fn create(
   }
 
   new_packs
+}
+
+#[cfg(test)]
+mod tests {
+  use std::{path::PathBuf, sync::Arc};
+
+  use itertools::Itertools;
+  use rspack_error::Result;
+  use rustc_hash::FxHashMap as HashMap;
+
+  use crate::{
+    pack::{
+      Pack, PackContentsState, PackFileMeta, PackKeysState, PackWriteStrategy, SplitPackStrategy,
+      UpdatePacksResult,
+    },
+    PackFs, PackMemoryFs, PackOptions,
+  };
+
+  async fn test_write_pack(strategy: &SplitPackStrategy) -> Result<()> {
+    let mut pack = Pack::new(PathBuf::from("/cache/test_write_pack/pack"));
+    pack.keys = PackKeysState::Value(vec![
+      Arc::new("key_1".as_bytes().to_vec()),
+      Arc::new("key_2".as_bytes().to_vec()),
+    ]);
+    pack.contents = PackContentsState::Value(vec![
+      Arc::new("val_1".as_bytes().to_vec()),
+      Arc::new("val_2".as_bytes().to_vec()),
+    ]);
+    strategy.write_pack(&pack).await?;
+
+    let mut reader = strategy
+      .fs
+      .read_file(
+        &strategy
+          .get_temp_path(&pack.path)
+          .expect("should get temp path"),
+      )
+      .await?;
+    assert_eq!(reader.line().await?, "5 5");
+    assert_eq!(reader.line().await?, "5 5");
+    assert_eq!(reader.bytes(5).await?, "key_1".as_bytes());
+    assert_eq!(reader.bytes(5).await?, "key_2".as_bytes());
+    assert_eq!(reader.bytes(5).await?, "val_1".as_bytes());
+    assert_eq!(reader.bytes(5).await?, "val_2".as_bytes());
+    Ok(())
+  }
+
+  fn mock_updates(
+    item_count: usize,
+    pre: usize,
+    remove: bool,
+  ) -> HashMap<Arc<Vec<u8>>, Option<Arc<Vec<u8>>>> {
+    let mut updates = HashMap::default();
+    for i in pre..pre + item_count {
+      let key = format!("{:0>6}_key", i);
+      let val = format!("{:0>6}_val", i);
+      updates.insert(
+        Arc::new(key.as_bytes().to_vec()),
+        if remove {
+          None
+        } else {
+          Some(Arc::new(val.as_bytes().to_vec()))
+        },
+      );
+    }
+
+    updates
+  }
+
+  fn update_packs(update_res: UpdatePacksResult) -> HashMap<Arc<PackFileMeta>, Pack> {
+    update_res
+      .remain_packs
+      .into_iter()
+      .chain(
+        update_res
+          .new_packs
+          .into_iter()
+          .map(|(meta, pack)| (Arc::new(meta), pack)),
+      )
+      .collect::<HashMap<Arc<PackFileMeta>, Pack>>()
+  }
+
+  fn get_pack_sizes(update_res: &UpdatePacksResult) -> Vec<usize> {
+    let mut sizes = update_res
+      .remain_packs
+      .iter()
+      .map(|(_, pack)| pack.size())
+      .chain(update_res.new_packs.iter().map(|(_, pack)| pack.size()))
+      .collect_vec();
+    sizes.sort_unstable();
+    sizes
+  }
+
+  async fn test_update_packs(strategy: &SplitPackStrategy) -> Result<()> {
+    let dir = PathBuf::from("/cache/test_update_packs");
+    let options = PackOptions {
+      buckets: 1,
+      max_pack_size: 2000,
+      expires: 100000,
+    };
+
+    // half pack
+    let mut packs = HashMap::default();
+    let res = strategy
+      .update_packs(dir.clone(), &options, packs, mock_updates(50, 0, false))
+      .await;
+    assert_eq!(res.new_packs.len(), 1);
+    assert_eq!(res.remain_packs.len(), 0);
+    assert_eq!(get_pack_sizes(&res), vec![1000]);
+
+    packs = update_packs(res);
+
+    // full pack
+    let res = strategy
+      .update_packs(dir.clone(), &options, packs, mock_updates(50, 50, false))
+      .await;
+    assert_eq!(res.new_packs.len(), 1);
+    assert_eq!(res.remain_packs.len(), 0);
+    assert_eq!(res.removed_files.len(), 1);
+    assert_eq!(get_pack_sizes(&res), vec![2000]);
+
+    packs = update_packs(res);
+
+    // almost full pack
+    let res = strategy
+      .update_packs(dir.clone(), &options, packs, mock_updates(90, 100, false))
+      .await;
+    assert_eq!(res.new_packs.len(), 1);
+    assert_eq!(res.remain_packs.len(), 1);
+    assert_eq!(res.removed_files.len(), 0);
+    assert_eq!(get_pack_sizes(&res), vec![1800, 2000]);
+
+    packs = update_packs(res);
+
+    let res = strategy
+      .update_packs(dir.clone(), &options, packs, mock_updates(10, 190, false))
+      .await;
+    assert_eq!(res.new_packs.len(), 1);
+    assert_eq!(res.remain_packs.len(), 2);
+    assert_eq!(res.removed_files.len(), 0);
+    assert_eq!(get_pack_sizes(&res), vec![200, 1800, 2000]);
+
+    packs = update_packs(res);
+
+    // long item pack
+    let mut updates = HashMap::default();
+    updates.insert(
+      Arc::new(format!("{:0>1200}", 0).as_bytes().to_vec()),
+      Some(Arc::new(format!("{:0>1200}", 0).as_bytes().to_vec())),
+    );
+    updates.insert(
+      Arc::new(format!("{:0>900}", 1).as_bytes().to_vec()),
+      Some(Arc::new(format!("{:0>900}", 1).as_bytes().to_vec())),
+    );
+    let res = strategy
+      .update_packs(dir.clone(), &options, packs, updates)
+      .await;
+    assert_eq!(res.new_packs.len(), 3);
+    assert_eq!(res.remain_packs.len(), 2);
+    assert_eq!(res.removed_files.len(), 1);
+    assert_eq!(get_pack_sizes(&res), vec![200, 1800, 1800, 2000, 2400]);
+
+    packs = update_packs(res);
+
+    // remove items pack
+    let res = strategy
+      .update_packs(dir.clone(), &options, packs, mock_updates(30, 100, true))
+      .await;
+    assert_eq!(res.new_packs.len(), 1);
+    assert_eq!(res.remain_packs.len(), 3);
+    assert_eq!(res.removed_files.len(), 2);
+    assert_eq!(get_pack_sizes(&res), vec![1400, 1800, 2000, 2400]);
+
+    packs = update_packs(res);
+
+    // update items pack
+    let mut updates = HashMap::default();
+    updates.insert(
+      Arc::new(format!("{:0>6}_key", 131).as_bytes().to_vec()),
+      Some(Arc::new(format!("{:0>6}_valaaa", 131).as_bytes().to_vec())),
+    );
+    let res = strategy
+      .update_packs(dir.clone(), &options, packs, updates)
+      .await;
+    assert_eq!(res.new_packs.len(), 1);
+    assert_eq!(res.remain_packs.len(), 3);
+    assert_eq!(res.removed_files.len(), 1);
+    assert_eq!(get_pack_sizes(&res), vec![1403, 1800, 2000, 2400]);
+
+    Ok(())
+  }
+
+  #[tokio::test]
+  async fn should_write_pack() {
+    let fs = Arc::new(PackMemoryFs::default());
+    fs.remove_dir(&PathBuf::from("/cache/test_write_pack"))
+      .await
+      .expect("should clean dir");
+    let strategy = SplitPackStrategy::new(
+      PathBuf::from("/cache/test_write_pack"),
+      PathBuf::from("/temp/test_write_pack"),
+      fs.clone(),
+    );
+
+    let _ = test_write_pack(&strategy)
+      .await
+      .map_err(|e| panic!("{}", e));
+  }
+
+  #[tokio::test]
+  async fn should_update_packs() {
+    let fs = Arc::new(PackMemoryFs::default());
+    fs.remove_dir(&PathBuf::from("/cache/test_update_packs"))
+      .await
+      .expect("should clean dir");
+    let strategy = SplitPackStrategy::new(
+      PathBuf::from("/cache/test_update_packs"),
+      PathBuf::from("/temp/test_update_packs"),
+      fs.clone(),
+    );
+
+    let _ = test_update_packs(&strategy)
+      .await
+      .map_err(|e| panic!("{}", e));
+  }
 }

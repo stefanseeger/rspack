@@ -8,10 +8,8 @@ use futures::{future::join_all, TryFutureExt};
 use itertools::Itertools;
 use rspack_error::{error, Result};
 
-use super::{util::get_pack_meta_pairs, SplitPackStrategy};
-use crate::pack::{
-  PackContents, PackKeys, PackReadStrategy, PackScope, ScopeValidateStrategy, ValidateResult,
-};
+use super::{util::get_indexed_packs, SplitPackStrategy};
+use crate::pack::{PackContents, PackKeys, PackScope, ScopeValidateStrategy, ValidateResult};
 
 #[derive(Debug)]
 pub struct ValidatingPack {
@@ -42,7 +40,7 @@ impl ScopeValidateStrategy for SplitPackStrategy {
   }
 
   async fn validate_packs(&self, scope: &mut PackScope) -> Result<ValidateResult> {
-    let (_, pack_list) = get_pack_meta_pairs(scope)?;
+    let (_, pack_list) = get_indexed_packs(scope)?;
 
     let candidates = pack_list
       .into_iter()
